@@ -1,0 +1,62 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+solc = "0.8.34"
+evm_version = "osaka"
+optimizer = true
+optimizer_runs = 200
+
+# `DeployLocal` ecrit les adresses deployees la, pour que dev-local.sh fabrique le .env.local sans
+# qu'on ait a recopier trois adresses a la main. Portee au seul repertoire deployments/ : forge
+# interdit l'ecriture par defaut, et c'est une bonne chose qu'un script ne puisse pas toucher au
+# reste du depot.
+#
+# Doit rester dans [profile.default] : en TOML une cle nue appartient a la derniere table declaree,
+# et placee plus bas elle finirait silencieusement dans [profile.deep.fuzz] sans aucun effet.
+fs_permissions = [{ access = "read-write", path = "./deployments" }]
+
+# Tout tourne sur fork : chaque run coute des appels RPC. 64 runs suffisent a couvrir les bornes
+# des proprietes testees, le cache de fork absorbe le reste.
+[fuzz]
+runs = 64
+
+# `FOUNDRY_PROFILE=deep forge test` avant tout deploiement.
+# Attention : a ce volume le RPC public de Base rate-limite (HTTP 429), et l'echec ressemble a un
+# echec de propriete sans en etre un. Utiliser un endpoint dedie (Alchemy/QuickNode) pour ce profil.
+# Palier intermediaire, tenable sur le RPC public.
+[profile.mid.fuzz]
+runs = 256
+
+[profile.deep.fuzz]
+runs = 1000
+
+[rpc_endpoints]
+base = "${BASE_RPC_URL}"
+# Anvil forke de Base, monte par scripts/dev-local.sh. `DeployLocal` verifie que l'URL pointe bien
+# ici avant de deployer : un anvil forke garde le chainId de Base, donc le chainId ne protege de
+# rien, et le script confie l'operator a une cle publiquement connue.
+#
+# Variable et non URL en dur : le port de l'anvil local est surchargeable (`ANVIL_PORT`), et une
+# valeur figee a 8545 ferait deployer ailleurs que sur le noeud qui vient d'etre lance. Non
+# renseignee, elle vaut la chaine vide et la garde de `DeployLocal` refuse de deployer — c'est
+# l'echec voulu, plutot qu'une diffusion vers un noeud qu'on n'a pas choisi.
+local = "${LOCAL_RPC_URL}"
+
+# Campagne stateful sur fork : chaque appel est un aller-retour RPC, et les 7 invariants tournent en
+# parallele. 8 sequences de 48 appels sont ce que le RPC public de Base absorbe sans repondre 429.
+# `FOUNDRY_PROFILE=mid` au-dela, avec un endpoint dedie.
+# `fail_on_revert = false` : le handler encaisse deja les refus legitimes (cap, budget, pause) ; un
+# revert n'est pas une violation, c'est le systeme qui refuse ce qu'il doit refuser.
+[invariant]
+runs = 8
+depth = 48
+fail_on_revert = false
+
+[profile.mid.invariant]
+runs = 48
+depth = 64
+
+[profile.deep.invariant]
+runs = 128
+depth = 128

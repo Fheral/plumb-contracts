@@ -1,0 +1,6 @@
+{
+  "filter_paths": "lib/|test/|src/interfaces/midnight/",
+  "exclude_dependencies": true,
+  "exclude_informational": false,
+  "detectors_to_exclude": "timestamp,naming-convention,solc-version,assembly,calls-loop,reentrancy-events,reentrancy-benign,incorrect-equality"
+}
