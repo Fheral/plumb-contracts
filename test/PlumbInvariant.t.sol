@@ -128,7 +128,10 @@ contract PlumbHandler is MidnightForkBase {
     ///      campaign claims to verify. The refusals (cap, budget, size) have their unit tests;
     ///      here we want state, not reverts.
     function hitBid(uint256 units, uint256 marketSeed) external track("hitBid") {
-        if (MATURITY <= block.timestamp + 2 days) return;
+        if (MATURITY <= block.timestamp + 2 days) {
+            calls["hitBid.tooLate"] += 1;
+            return;
+        }
 
         uint256 nav = vault.totalAssets();
         uint256 book = vault.bookValue();
@@ -136,7 +139,10 @@ contract PlumbHandler is MidnightForkBase {
         capRoom = capRoom > book ? capRoom - book : 0;
 
         uint256 room = _min(_min(vault.remainingBudget(), vault.maxSingleFill()), capRoom);
-        if (room < 1_000e6) return;
+        if (room < 1_000e6) {
+            calls["hitBid.noRoom"] += 1;
+            return;
+        }
         units = bound(units, 1_000e6, _min(room, 60_000e6));
         try this.originateAndTake(_variant(marketSeed % 3), units) {
             calls["hitBid.filled"] += 1;
@@ -187,9 +193,18 @@ contract PlumbHandler is MidnightForkBase {
 
     /// @dev Time never advances past maturity: beyond that point the Midnight market changes
     ///      regime, and it is no longer the same system being tested.
+    ///
+    ///      Each jump takes at most a **quarter of the tenor left**, so the clock approaches
+    ///      maturity geometrically and never arrives. The previous bound — up to ten days, flat —
+    ///      made `warp` a one-way ratchet: four or five draws burned the whole tenor, `hitBid`
+    ///      returned early on `MATURITY <= now + 2 days` for the rest of the run, and the campaign
+    ///      finished checking invariants on a book that could no longer be filled. Nothing about
+    ///      that state is worth an entire sequence — the end of a tenor is what `settle` and the
+    ///      maturity unit tests are for.
     function warp(uint256 dt) external track("warp") {
-        if (MATURITY <= block.timestamp + 1 days) return;
-        uint256 room = MATURITY - block.timestamp - 1 days;
+        if (MATURITY <= block.timestamp + 2 days) return;
+        uint256 room = (MATURITY - block.timestamp - 2 days) / 4;
+        if (room < 1 hours) return;
         vm.warp(block.timestamp + bound(dt, 1 hours, room > 10 days ? 10 days : room));
     }
 
@@ -334,18 +349,38 @@ contract PlumbInvariantTest is MidnightForkBase {
         // `originateAndTake` and `marketAt` are internal cogs of the handler, not actions an
         // actor could trigger. Leaving them in the target would waste half the calls on
         // authorization reverts.
-        bytes4[] memory sels = new bytes4[](11);
-        sels[0] = PlumbHandler.deposit.selector;
-        sels[1] = PlumbHandler.withdraw.selector;
-        sels[2] = PlumbHandler.redeemAll.selector;
-        sels[3] = PlumbHandler.hitBid.selector;
-        sels[4] = PlumbHandler.markMarket.selector;
-        sels[5] = PlumbHandler.settleMarket.selector;
-        sels[6] = PlumbHandler.repayPartial.selector;
-        sels[7] = PlumbHandler.warp.selector;
-        sels[8] = PlumbHandler.rotateEpoch.selector;
-        sels[9] = PlumbHandler.setRisk.selector;
-        sels[10] = PlumbHandler.setFee.selector;
+        // Weighted, by repetition: the fuzzer draws uniformly from this array, so listing a
+        // selector `n` times gives it `n` chances.
+        //
+        // Not a cosmetic tuning. With eleven equally likely actions and a depth of 48, a run drew
+        // about four buys, and a run that missed all four ended inert — `afterInvariant` then
+        // failed the whole campaign, at random, on roughly one seed in six. Buying is the action
+        // every other one is *about*: a settlement, a withdrawal under load, a cap tightening on a
+        // loaded book all presuppose a book. Governance knobs, conversely, only need to be drawn
+        // occasionally to interleave — drawn as often as buys, they merely reset the state buys
+        // build. Raising `runs` would have made the failure rarer without making it impossible;
+        // this makes the sterile run itself unlikely.
+        bytes4[] memory sels = new bytes4[](20);
+        uint256 n;
+        for (uint256 i; i < 5; ++i) {
+            sels[n++] = PlumbHandler.hitBid.selector;
+        }
+        for (uint256 i; i < 3; ++i) {
+            sels[n++] = PlumbHandler.deposit.selector;
+        }
+        sels[n++] = PlumbHandler.withdraw.selector;
+        sels[n++] = PlumbHandler.withdraw.selector;
+        sels[n++] = PlumbHandler.redeemAll.selector;
+        sels[n++] = PlumbHandler.markMarket.selector;
+        sels[n++] = PlumbHandler.markMarket.selector;
+        sels[n++] = PlumbHandler.settleMarket.selector;
+        sels[n++] = PlumbHandler.settleMarket.selector;
+        sels[n++] = PlumbHandler.repayPartial.selector;
+        sels[n++] = PlumbHandler.warp.selector;
+        sels[n++] = PlumbHandler.rotateEpoch.selector;
+        sels[n++] = PlumbHandler.setRisk.selector;
+        sels[n++] = PlumbHandler.setFee.selector;
+        assertEq(n, sels.length, "selector weights and array size disagree");
         targetSelector(FuzzSelector({addr: address(handler), selectors: sels}));
         targetContract(address(handler));
     }
@@ -456,6 +491,9 @@ contract PlumbInvariantTest is MidnightForkBase {
     function afterInvariant() public view {
         assertGt(handler.calls("deposit"), 0, "no deposit: inert campaign");
         assertGt(handler.calls("hitBid.filled"), 0, "no completed buy: inert campaign");
+        console2.log("tooLate    ", handler.calls("hitBid.tooLate"));
+        console2.log("noRoom     ", handler.calls("hitBid.noRoom"));
+        console2.log("daysLeft   ", (MATURITY - block.timestamp) / 1 days);
         console2.log("completed buys", handler.calls("hitBid.filled"));
         console2.log("deposits   ", handler.calls("deposit"));
         console2.log("hitBid ok  ", handler.calls("hitBid.filled"));
