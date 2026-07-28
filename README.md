@@ -89,6 +89,18 @@ Justified exclusions are pinned in `slither.config.json`; the detailed triage
 (remaining findings, uncovered scope) lives in the main monorepo and will be
 published alongside the audit report.
 
+## Releases
+
+This mirror tracks the tip of the monorepo's `main`, which is convenient for
+reading and useless for depending on. Tagged releases are the fixed points:
+each one carries its `CHANGELOG.md` entry and a zip of the ABIs
+(`PlumbVault`, `QuoteModule`, `IQuoteContext`) built from that exact source.
+
+See [releases](https://github.com/Fheral/plumb-contracts/releases) and
+[`CHANGELOG.md`](CHANGELOG.md). Versions describe *source*, not a live
+deployment — a release is on Base only when the changelog entry lists its
+addresses.
+
 ## Two things to know before reading the code
 
 The vault is **its own ratifier** and **its own buy callback**. An offer is
