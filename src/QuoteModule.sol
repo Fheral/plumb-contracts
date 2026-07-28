@@ -64,9 +64,43 @@ contract QuoteModule is Ownable2Step {
     /// @dev Applies to every market: it prices Plumb's own illiquidity, not the collateral's risk.
     uint256 public blueFloorMarginBps = 200;
 
+    /// @notice Highest Midnight continuous fee Plumb agrees to pay, in Midnight's own units.
+    ///
+    /// @dev Every offer carries this value as its `continuousFeeCap`, and Midnight refuses the
+    ///      `take` if the market's fee exceeds it. The fee is Midnight governance's to set, at any
+    ///      time, on live offers Plumb has already broadcast — so this is the only place Plumb gets
+    ///      to say how much of the depositors' yield it accepts to hand over.
+    ///
+    ///      The exposure is bounded by Midnight itself: `ConstantsLib.MAX_CONTINUOUS_FEE` is an
+    ///      immutable 1% a year, checked in both `setMarketContinuousFee` and
+    ///      `setDefaultContinuousFee`, i.e. at most 24.66 bps of a lot over Plumb's 90-day maximum
+    ///      tenor. So the question this cap answers is not "how much could we lose" — that is
+    ///      known — but "do we accept to pay it before having measured it".
+    ///
+    ///      The default is **zero**, and the answer is no: the fee is zero on every Base market
+    ///      today, and `feeSetter` is `address(0)`, so no one can currently set one at all. Zero
+    ///      means the day that changes, Plumb's takes revert instead of quietly paying — an outage
+    ///      the owner resolves by pricing the fee in and raising this cap, which is a decision, not
+    ///      an accident.
+    ///
+    ///      **Raising it requires `PlumbVault._redeemable` to already be in place**: a nonzero fee
+    ///      is the only thing that gives a lot a `pendingFee`, and marking against `credit` alone
+    ///      would then overstate the book. The two changes belong together.
+    ///
+    ///      Denominated in raw Midnight units, because that is what the offer field is compared
+    ///      against.
+    uint256 public continuousFeeCap;
+
+    /// @notice The most this cap can be set to: Midnight's own `MAX_CONTINUOUS_FEE`.
+    /// @dev `uint32(uint256(0.01e18) / uint256(365 days))`. A cap above this could not change any
+    ///      outcome — Midnight rejects such a fee at the setter — so allowing it would only let the
+    ///      owner write a number that reads like a policy and is not one.
+    uint256 public constant MAX_CONTINUOUS_FEE_CAP = 317_097_919;
+
     event SetMarketConfig(bytes32 indexed id, MarketConfig config);
     event SetVault(address indexed vault);
     event SetBlueFloorMargin(uint256 marginBps);
+    event SetContinuousFeeCap(uint256 cap);
 
     error MarketDisabled();
     error RateOutOfBounds();
@@ -79,6 +113,7 @@ contract QuoteModule is Ownable2Step {
     error VaultNotSet();
     error BelowBlueFloor();
     error ZeroAddress();
+    error FeeCapOutOfBounds();
 
     constructor(address owner_) Ownable(owner_) {}
 
@@ -113,6 +148,15 @@ contract QuoteModule is Ownable2Step {
         require(marginBps <= MAX_ADJUSTMENT_BPS, AdjustmentOutOfBounds());
         blueFloorMarginBps = marginBps;
         emit SetBlueFloorMargin(marginBps);
+    }
+
+    /// @notice Sets the highest Midnight continuous fee Plumb agrees to pay. See `continuousFeeCap`.
+    /// @dev Raising this is an economic decision — it hands part of the depositors' yield to
+    ///      Midnight governance — hence `onlyOwner`, i.e. the multisig, never the bot.
+    function setContinuousFeeCap(uint256 cap) external onlyOwner {
+        require(cap <= MAX_CONTINUOUS_FEE_CAP, FeeCapOutOfBounds());
+        continuousFeeCap = cap;
+        emit SetContinuousFeeCap(cap);
     }
 
     /// @notice The annualized rate Plumb actually demands on this market at this instant, in bps.

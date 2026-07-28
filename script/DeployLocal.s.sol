@@ -13,8 +13,8 @@ import {BlueMarketParams} from "../src/interfaces/IMorphoBlue.sol";
 ///
 /// @dev Local-fork only, and the script refuses to run anywhere else. It hands the operator an
 ///      anvil key known to everyone and sets loose risk parameters — two things that only make
-///      sense on a throwaway chain. A mainnet deployment will go through a separate script,
-///      reviewed on its own, rather than a flag added here: that is the difference between a
+///      sense on a throwaway chain. The mainnet deployment is `DeployMainnet.s.sol`, a separate
+///      script reviewed on its own rather than a flag added here: that is the difference between a
 ///      guardrail and a checkbox to untick.
 ///
 ///      The fork carries the real Midnight, Morpho Blue and USDC of Base. Nothing is simulated:
@@ -60,9 +60,12 @@ contract DeployLocal is Script {
             id,
             QuoteModule.MarketConfig({
                 enabled: true,
-                rateBps: 900, // 9% annualized: in the middle of the [500, 3000] bounds
-                volSpreadBps: 150, // WETH collateral: a modest risk premium
-                skewBps: 400, // non-zero on purpose, so the local book exercises the skew
+                // The three pricing parameters are the ones `DeployMainnet` ships, and for the
+                // same reasons (`CALIBRATION.md`). A local book that priced differently from
+                // production would be a rehearsal of something else.
+                rateBps: 900,
+                volSpreadBps: 250,
+                skewBps: 600,
                 minTenor: 1 days,
                 maxTenor: 90 days,
                 maxUnits: 500_000e6

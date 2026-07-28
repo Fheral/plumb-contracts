@@ -15,6 +15,59 @@ below list it.
 
 ## [Unreleased]
 
+### Added
+
+- `script/DeployMainnet.s.sol` — the Base deployment. Deploys the vault and the
+  policy owned by the multisig from the first block, then stops: everything
+  after that is `onlyOwner`, so it prints the calls in order rather than
+  performing them, and `openEpoch` — the call that starts the quoting — is left
+  to a deliberate moment. Refuses any chain but Base, a local RPC, and a
+  deployer that would keep ownership, the operator role or the fee stream.
+- `CALIBRATION.md` — the parameters the policy is deployed with and the
+  reasoning that produced each one, including what is *not* known: Midnight is
+  too young to fit anything against, so every value is derived from a stated
+  principle and carries the observation that would move it.
+- `script/Admin.s.sol` — builds every privileged call of a deployed vault
+  (`unpause`, `setOperator`, `setBlueMarket`, `setRiskParams`, `setFee`,
+  `kill`, `openEpoch`, and the `QuoteModule` knobs) as a Safe-ready
+  `to`/`value`/`data` triplet. It holds no key and broadcasts nothing: it
+  simulates the call against current chain state, refuses to print a proposal
+  that reverts, and prints the calldata. `state()` dumps what the two
+  contracts hold today, which is what a parameter change has to be read
+  against.
+
+### Changed
+
+- **Breaking (policy)** — an offer's `continuousFeeCap` is now bounded by
+  `QuoteModule.continuousFeeCap()` instead of the `type(uint256).max / 2`
+  arithmetic ceiling. Midnight's continuous fee is set by its governance, at
+  any time, and applies to offers already broadcast; the previous bound let it
+  take an unbounded share of the depositors' yield without Plumb redeploying or
+  even rebroadcasting. The policy now states what Plumb accepts to pay, and
+  `isRatified` refuses anything above it.
+
+  The default is **zero**, which is the fee every Base market prices today. If
+  Midnight ever switches it on, takes revert until the owner prices the fee in
+  via `setContinuousFeeCap` — an outage rather than a silent leak. The cap is
+  denominated in Midnight's own units and bounded by
+  `MAX_CONTINUOUS_FEE_CAP = 317_097_919`, Midnight's own
+  `ConstantsLib.MAX_CONTINUOUS_FEE` (1% a year, i.e. at most 24.66 bps of a lot
+  over a 90-day tenor). Anything above it is a fee no market could ever charge.
+
+- **Breaking (accounting)** — a lot is now marked at `credit - pendingFee`
+  rather than `credit`. Midnight's `credit` is net of the continuous fee
+  accrued *so far*; the remainder sits in `pendingFee` and comes out of
+  `credit` by maturity, so the par a lot accretes toward is the difference.
+  Marking against `credit` alone counted Midnight's fee as depositors' value
+  for a lot's whole life.
+
+  The gap is bounded by `pendingFee` and closes to exactly zero at maturity, so
+  it never shows in a settled amount — only in the share price of anyone
+  entering or leaving mid-life. It is also zero in practice today: with
+  `continuousFeeCap` at zero no lot can carry a `pendingFee` at all.
+  `PlumbVault._redeemable` is therefore a no-op that has to exist *before*
+  that cap is ever raised. The two are a pair.
+
 ## [0.1.0] — 2026-07-28
 
 First tagged release. Phases 1–3 complete: the vault, the pricing policy and

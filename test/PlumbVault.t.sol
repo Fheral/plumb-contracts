@@ -340,4 +340,86 @@ contract PlumbVaultTest is MidnightForkBase {
         vault.withdraw(liquid, LP, LP);
         assertGt(vault.balanceOf(LP), 0, "the LP keeps shares against the book");
     }
+
+    // -------------------------------------------------------------------------
+    // The continuous fee is not ours to count
+    // -------------------------------------------------------------------------
+
+    /// @dev Midnight's own ceiling on the continuous fee (`ConstantsLib.MAX_CONTINUOUS_FEE`):
+    ///      1% a year, i.e. at most 24.66 bps of a lot over Plumb's 90-day maximum tenor.
+    uint256 constant MIDNIGHT_MAX_CONTINUOUS_FEE = 317_097_919;
+
+    /// @dev Turns the fee on at the protocol maximum, the way Midnight governance would: the
+    ///      configurator appoints a fee setter, the fee setter sets the market's fee. On Base today
+    ///      `feeSetter` is `address(0)`, so this is the first move anyone would have to make — and
+    ///      it is the one the monitoring alert watches for.
+    function _midnightTurnsOnTheFee() internal {
+        vm.prank(MIDNIGHT.configurator());
+        MIDNIGHT.setFeeSetter(address(this));
+        MIDNIGHT.setMarketContinuousFee(id, MIDNIGHT_MAX_CONTINUOUS_FEE);
+        assertEq(MIDNIGHT.continuousFee(id), uint32(MIDNIGHT_MAX_CONTINUOUS_FEE), "fee must be live");
+    }
+
+    /// @notice A lot's mark is net of the continuous fee still to accrue on it.
+    ///
+    /// @dev Midnight's `credit` is net of the fee accrued *so far*; the rest sits in `pendingFee`
+    ///      and will come out of `credit` by maturity. So the par a lot accretes toward is
+    ///      `credit - pendingFee`. Marking against `credit` alone counts Midnight's fee as
+    ///      depositors' money for the whole life of the lot — an overstatement that decays to zero
+    ///      at maturity, and therefore never shows up in a settlement. It shows up in the share
+    ///      price of anyone entering or leaving mid-life, which is most people.
+    function test_TheMarkIsNetOfTheContinuousFeeStillToAccrue() public {
+        _midnightTurnsOnTheFee();
+        // Plumb only buys into a fee-charging market once the owner has priced the fee in.
+        vm.prank(OWNER);
+        quote.setContinuousFeeCap(MIDNIGHT_MAX_CONTINUOUS_FEE);
+
+        _originate(SELLER, 50_000e6, 370);
+        _hitBid(50_000e6);
+        vm.warp(block.timestamp + 30 days);
+
+        (uint128 credit, uint128 pending,) = MIDNIGHT.updatePositionView(midnightMarket(), id, address(vault));
+        assertGt(pending, 0, "the lot must carry a fee still to accrue, or this proves nothing");
+
+        // What the old rule would have produced: the same accretion, aimed at `credit` instead of
+        // `credit - pendingFee`. Spelled out rather than referenced, so the test states the two
+        // rules itself and does not merely agree with the implementation.
+        (uint128 bookUnits, uint128 bookValue, uint64 lastMark, uint64 maturity) = vault.book(id);
+        uint256 unnettedUnits = credit < bookUnits ? credit : bookUnits;
+        uint256 unnettedValue = credit < bookUnits ? (uint256(bookValue) * credit) / bookUnits : bookValue;
+        uint256 unnetted =
+            unnettedValue + ((unnettedUnits - unnettedValue) * (block.timestamp - lastMark)) / (maturity - lastMark);
+
+        assertLt(vault.previewMark(id), unnetted, "the fee must not be marked as depositors' value");
+        assertLe(vault.previewMark(id), credit - pending, "and the mark may never exceed the terminal payoff");
+    }
+
+    /// @notice At maturity the two rules coincide — which is why the gap is invisible in a settlement.
+    /// @dev Worth pinning: it is the reason this can be wrong for a lot's whole life without any
+    ///      settled amount ever disagreeing, and so the reason it needs a test rather than a
+    ///      reconciliation.
+    function test_AtMaturityTheFeeHasFullyAccruedAndTheGapCloses() public {
+        _midnightTurnsOnTheFee();
+        vm.prank(OWNER);
+        quote.setContinuousFeeCap(MIDNIGHT_MAX_CONTINUOUS_FEE);
+
+        _originate(SELLER, 50_000e6, 370);
+        _hitBid(50_000e6);
+        vm.warp(MATURITY);
+
+        (uint128 credit, uint128 pending,) = MIDNIGHT.updatePositionView(midnightMarket(), id, address(vault));
+        assertEq(pending, 0, "the fee has fully accrued at maturity");
+        assertEq(vault.previewMark(id), credit, "so the netted and un-netted marks are the same number");
+    }
+
+    /// @notice And with the shipped cap, none of the above can arise: no lot carries a fee at all.
+    function test_TheShippedCapKeepsEveryLotFeeFree() public {
+        _midnightTurnsOnTheFee(); // cap stays at its default of zero
+        _originate(SELLER, 50_000e6, 370);
+
+        Offer memory bid = vault.buildBid(midnightMarket(), type(uint256).max);
+        vm.prank(SELLER);
+        vm.expectRevert(IMidnight.ContinuousFeeAboveOfferCap.selector);
+        MIDNIGHT.take(bid, "", 50_000e6, SELLER, SELLER, address(0), "");
+    }
 }

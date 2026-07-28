@@ -252,17 +252,38 @@ contract PlumbVault is ERC4626, Ownable2Step, Pausable, ReentrancyGuard, IBuyCal
         Book memory b = book[id];
         if (b.units == 0) return 0;
 
-        (uint128 credit,,) = MIDNIGHT.updatePositionView(MIDNIGHT.toMarket(id), id, address(this));
+        (uint128 credit, uint128 pendingFee,) = MIDNIGHT.updatePositionView(MIDNIGHT.toMarket(id), id, address(this));
+        uint256 held = _redeemable(credit, pendingFee);
         uint256 units = b.units;
         uint256 value = b.value;
         // Slashing: the credit may have melted. The loss is taken pro rata, immediately.
-        if (credit < units) {
-            value = (value * credit) / units;
-            units = credit;
+        if (held < units) {
+            value = (value * held) / units;
+            units = held;
         }
         if (block.timestamp >= b.maturity) return units;
         // Linear accretion from purchase price to par, over the time left since the last mark.
         return value + ((units - value) * (block.timestamp - b.lastMark)) / (b.maturity - b.lastMark);
+    }
+
+    /// @notice What a Midnight position is actually worth held to maturity: credit net of the
+    ///         continuous fee still to accrue on it.
+    ///
+    /// @dev Midnight's `credit` is net of the fee accrued *so far*; `pendingFee` is the rest, which
+    ///      will have come out of `credit` by maturity. So the par Plumb accretes toward is
+    ///      `credit - pendingFee`, not `credit` — reading only the first return value overstates
+    ///      every lot, and with it the NAV and the share price.
+    ///
+    ///      Both terms are zero in practice: `QuoteModule.continuousFeeCap` is zero, so Midnight
+    ///      rejects any `take` on a market charging a continuous fee, and no lot Plumb can buy
+    ///      carries a `pendingFee`. This function is therefore a no-op today — and it is what makes
+    ///      raising that cap a pricing decision rather than a silent accounting error.
+    ///
+    ///      Saturating rather than reverting: Midnight holds `pendingFee <= credit` as an invariant,
+    ///      but this sits on the read path of every deposit and every withdrawal, and a position
+    ///      worth nothing is a better answer there than a vault nobody can leave.
+    function _redeemable(uint128 credit, uint128 pendingFee) internal pure returns (uint256) {
+        return credit > pendingFee ? credit - pendingFee : 0;
     }
 
     /// @dev Writes the mark. Calls `updatePosition` to materialize slashing and continuous fees.
@@ -270,10 +291,16 @@ contract PlumbVault is ERC4626, Ownable2Step, Pausable, ReentrancyGuard, IBuyCal
         b = book[id];
         if (b.units == 0) return b;
 
-        (uint128 credit,,) = MIDNIGHT.updatePosition(market, address(this));
-        if (credit < b.units) {
-            b.value = uint128((uint256(b.value) * credit) / b.units);
-            b.units = credit;
+        (uint128 credit, uint128 pendingFee,) = MIDNIGHT.updatePosition(market, address(this));
+        // The book carries what is redeemable, so `settle` withdraws against a number that cannot
+        // exceed the position's terminal value. Understating it before maturity would leave units
+        // behind — at maturity the fee has fully accrued and the two coincide exactly.
+        uint256 held = _redeemable(credit, pendingFee);
+        if (held < b.units) {
+            b.value = uint128((uint256(b.value) * held) / b.units);
+            // casting to 'uint128' is safe because held <= credit, a uint128 position field
+            // forge-lint: disable-next-line(unsafe-typecast)
+            b.units = uint128(held);
         }
         if (b.units == 0) {
             // A fully wiped market — total socialized loss — must free its slot. `settle` cannot
@@ -320,7 +347,11 @@ contract PlumbVault is ERC4626, Ownable2Step, Pausable, ReentrancyGuard, IBuyCal
         // The budget is shared: all live offers carry the same cap, hence the same `consumed`
         // counter. An offer declaring its own cap would escape the global one.
         require(offer.maxUnits == epochBudget && offer.maxAssets == 0, OfferWrongBudget());
-        require(offer.continuousFeeCap <= type(uint256).max / 2, OfferFeeCapTooHigh());
+        // Not an arithmetic bound but an economic one: the continuous fee is Midnight
+        // governance's to raise at any time, on offers Plumb has already broadcast. The policy
+        // says how much of the depositors' yield we accept to pay, and the offer may not
+        // promise more than that.
+        require(offer.continuousFeeCap <= QUOTE.continuousFeeCap(), OfferFeeCapTooHigh());
 
         Market memory m = offer.market;
         require(m.midnight == address(MIDNIGHT) && m.loanToken == asset(), OfferWrongMarket());
@@ -363,7 +394,7 @@ contract PlumbVault is ERC4626, Ownable2Step, Pausable, ReentrancyGuard, IBuyCal
             reduceOnly: false,
             maxUnits: epochBudget,
             maxAssets: 0,
-            continuousFeeCap: type(uint256).max / 2
+            continuousFeeCap: QUOTE.continuousFeeCap()
         });
     }
 

@@ -8,6 +8,20 @@ import {TickLib} from "../src/interfaces/midnight/TickLib.sol";
 import {PlumbVault} from "../src/PlumbVault.sol";
 import {QuoteModule} from "../src/QuoteModule.sol";
 
+/// @dev A vault stand-in whose only job is to say what Blue pays. The floor has to be checked
+///      against rates Blue is not printing today — that is the whole point of checking it.
+contract BlueRateStub {
+    uint256 public blueSupplyRateBps;
+
+    function setRate(uint256 bps) external {
+        blueSupplyRateBps = bps;
+    }
+
+    function book(bytes32) external pure returns (uint128, uint128, uint64, uint64) {
+        return (0, 0, 0, 0);
+    }
+}
+
 /// @notice The bid is not a constant.
 ///
 /// A fixed target rate has the defining flaw of static market making: you only get hit when you are
@@ -343,7 +357,142 @@ contract PlumbQuoteDynamicTest is MidnightForkBase {
     }
 
     // -------------------------------------------------------------------------
-    // 5. What it costs
+    // 5. The continuous fee is not a blank cheque
+    // -------------------------------------------------------------------------
+
+    /// @notice Plumb starts out refusing to pay any continuous fee at all.
+    ///
+    /// @dev Midnight's continuous fee is set by its governance, at any time, and applies to offers
+    ///      already broadcast. Every Base market prices it at zero today; the point of the default
+    ///      is that the day it stops being zero, Plumb's takes revert instead of quietly handing
+    ///      the depositors' yield over.
+    function test_TheBidPromisesNoContinuousFeeByDefault() public view {
+        assertEq(quote.continuousFeeCap(), 0, "the policy must not accept a fee nobody has priced");
+        Offer memory bid = vault.buildBid(midnightMarket(), type(uint256).max);
+        assertEq(bid.continuousFeeCap, 0, "the offer must carry the policy's cap, not its own");
+    }
+
+    /// @notice And ratification enforces it: the bot cannot promise more than the policy accepts.
+    function test_RatificationRefusesAnOfferPromisingMoreThanThePolicy() public {
+        Offer memory bid = vault.buildBid(midnightMarket(), type(uint256).max);
+        bid.continuousFeeCap = 1;
+
+        vm.expectRevert(PlumbVault.OfferFeeCapTooHigh.selector);
+        vault.isRatified(bid, "", SELLER);
+    }
+
+    /// @notice Raising the cap is the owner's call, and it moves the bid.
+    function test_TheOwnerCanPriceInAContinuousFee() public {
+        vm.expectRevert();
+        quote.setContinuousFeeCap(1000);
+
+        vm.prank(OWNER);
+        quote.setContinuousFeeCap(1000);
+
+        Offer memory bid = vault.buildBid(midnightMarket(), type(uint256).max);
+        assertEq(bid.continuousFeeCap, 1000, "the bid must follow the policy up");
+        vault.isRatified(bid, "", SELLER);
+
+        bid.continuousFeeCap = 1001;
+        vm.expectRevert(PlumbVault.OfferFeeCapTooHigh.selector);
+        vault.isRatified(bid, "", SELLER);
+    }
+
+    /// @notice The cap cannot be set beyond the fee Midnight would itself accept.
+    ///
+    /// @dev Pinned against the upstream constant rather than restated: Midnight's
+    ///      `ConstantsLib.MAX_CONTINUOUS_FEE` is `uint32(uint256(0.01e18) / uint256(365 days))`,
+    ///      enforced in `setMarketContinuousFee` and `setDefaultContinuousFee`. Anything above it
+    ///      is a number the owner could write and no market could ever match — a policy that reads
+    ///      like a decision without being one.
+    function test_TheCapIsBoundedByWhatMidnightWouldAccept() public {
+        uint256 max = quote.MAX_CONTINUOUS_FEE_CAP();
+        assertEq(max, uint256(0.01e18) / uint256(365 days), "must track Midnight's own ceiling");
+        assertEq((max * 90 days * 10_000) / 1e18, 24, "i.e. at most ~24.66 bps over a 90-day tenor");
+
+        vm.startPrank(OWNER);
+        quote.setContinuousFeeCap(max);
+
+        vm.expectRevert(QuoteModule.FeeCapOutOfBounds.selector);
+        quote.setContinuousFeeCap(max + 1);
+        vm.stopPrank();
+    }
+
+    /// @notice A fee Plumb has priced in does not block the take.
+    /// @dev The end-to-end check that the cap is a ceiling and not a required value: the market's
+    ///      fee is zero on the fork, and a non-zero cap must still let a seller through.
+    function test_ARaisedCapStillFills() public {
+        vm.prank(OWNER);
+        quote.setContinuousFeeCap(1000);
+
+        _hitBid(10_000e6);
+        (uint128 units,,,) = vault.book(id);
+        assertEq(units, 10_000e6, "a cap above the market's fee must not stand in the way");
+    }
+
+    // -------------------------------------------------------------------------
+    // 6. The Blue floor cannot take the bid offline
+    // -------------------------------------------------------------------------
+
+    /// @notice The margin we ship leaves room for a Blue rate far above anything USDC has printed.
+    ///
+    /// @dev `effectiveRateBps` reverts with `BelowBlueFloor` when `blueRate + margin` exceeds
+    ///      `MAX_RATE_BPS`: Plumb refuses to bid rather than quote above the bound that protects
+    ///      the counterparty. Correct, and the reason the pair (margin, Blue rate) has to be
+    ///      checked as a pair — a margin chosen on its own merits can silently pin the vault
+    ///      offline the day Blue spikes.
+    ///
+    ///      The bound is arithmetic and exact: the bid survives every Blue rate up to
+    ///      `MAX_RATE_BPS - margin`. At the shipped margin of 200 bps that is **28%** — Blue's USDC
+    ///      supply rate reads 4.6% at the pinned block and its stress peaks are an order of
+    ///      magnitude below 28%. What this test pins is the headroom, so that raising the margin
+    ///      later is a choice made against a number.
+    function test_TheShippedMarginLeavesTwentyEightPointsOfHeadroom() public {
+        QuoteModule solo = new QuoteModule(OWNER);
+        BlueRateStub stub = new BlueRateStub();
+
+        vm.startPrank(OWNER);
+        solo.setVault(address(stub));
+        solo.setMarketConfig(
+            id,
+            QuoteModule.MarketConfig({
+                enabled: true,
+                rateBps: 900,
+                volSpreadBps: 250,
+                skewBps: 600,
+                minTenor: 1 days,
+                maxTenor: 90 days,
+                maxUnits: MARKET_CAP
+            })
+        );
+        vm.stopPrank();
+
+        uint256 margin = solo.blueFloorMarginBps();
+        uint256 maxRate = solo.MAX_RATE_BPS();
+        assertEq(margin, 200, "the shipped margin");
+
+        // Right at the edge: the floor equals the ceiling, and Plumb still quotes.
+        stub.setRate(maxRate - margin);
+        assertEq(solo.effectiveRateBps(id), maxRate, "at the edge the bid must survive");
+
+        // One basis point further and it steps aside rather than quoting above MAX_RATE_BPS.
+        stub.setRate(maxRate - margin + 1);
+        vm.expectRevert(QuoteModule.BelowBlueFloor.selector);
+        solo.effectiveRateBps(id);
+    }
+
+    /// @notice And the three adjustments together never saturate the clamp on their own.
+    /// @dev If `rateBps + volSpreadBps + skewBps` reached `MAX_RATE_BPS`, a full book would quote
+    ///      the same rate as a half-full one and the skew would stop saying anything. The shipped
+    ///      set tops out at 17.5%, well inside the 30% clamp.
+    function test_TheShippedAdjustmentsNeverReachTheClamp() public {
+        vm.prank(OWNER);
+        _configure(900, 250, 600);
+        assertLt(900 + 250 + 600, quote.MAX_RATE_BPS(), "a saturated skew is a skew that says nothing");
+    }
+
+    // -------------------------------------------------------------------------
+    // 7. What it costs
     // -------------------------------------------------------------------------
 
     /// @notice The floor puts an IRM call on the critical path of every take. Measure it.

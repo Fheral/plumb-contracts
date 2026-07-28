@@ -40,6 +40,10 @@ src/PlumbVault.sol         the vault: accounting, ratification, execution, caps
 src/QuoteModule.sol        the pricing policy: target rate → Midnight tick
 src/interfaces/            Morpho Blue + the reverse-engineered Midnight surface
 
+script/Admin.s.sol          builds the privileged calls; signs and broadcasts nothing
+script/DeployMainnet.s.sol  deploys on Base, and refuses a local RPC or a deployer keeping any role
+script/DeployLocal.s.sol    deploys on a local anvil fork, and refuses to run anywhere else
+
 test/PlumbVault.t.sol        lifecycle, caps, kill switch, bypass attempts
 test/PlumbDefault.t.sol      borrower default: real slashing, NAV absorption
 test/PlumbAdversarial.t.sol  field-by-field ratification, access control, value extraction
@@ -57,7 +61,7 @@ on a Base fork: Midnight is not mocked — tests execute against the contracts
 actually deployed on mainnet.
 
 ```sh
-BASE_RPC_URL=https://mainnet.base.org forge test          # 60 tests
+BASE_RPC_URL=https://mainnet.base.org forge test          # 101 tests
 FOUNDRY_PROFILE=mid  BASE_RPC_URL=... forge test          # fuzz 256 runs, 48×64 stateful campaign
 ```
 
@@ -78,6 +82,48 @@ and any earlier spec makes `take()` fail with `NotActivated`.
   `vm.prank` or `vm.expectRevert`.
   `vault.setFee(vault.MAX_PERF_FEE_BPS() + 1, x)` therefore executes from the
   wrong address. Always hoist the read into a local variable first.
+
+## Deploying
+
+```sh
+DEPLOYER_PRIVATE_KEY=… OWNER=… OPERATOR=… FEE_RECIPIENT=… \
+  forge script script/DeployMainnet.s.sol --rpc-url base --broadcast --verify
+```
+
+The script deploys the two contracts, owned by the multisig from the first
+block, and stops there. It quotes nothing: `setVault`, `setMarketConfig`,
+`setBlueMarket`, `setRiskParams`, `setOperator` and finally `openEpoch` are
+`onlyOwner` calls, so they are the multisig's — it prints them in order, and
+`script/Admin.s.sol` builds each one. `openEpoch` is last and deliberate: it is
+what starts the quoting.
+
+It refuses to run on any chain that is not Base, on a local RPC, and — the
+check that matters — if the deployer would end up holding ownership, the
+operator role or the fee stream. Copying the local invocation is the likely
+accident, and the only one that cannot be undone.
+
+The parameters it deploys with, and the reasoning behind each number, are in
+[`CALIBRATION.md`](CALIBRATION.md).
+
+## Governing a deployed vault
+
+`owner` is a multisig, so every privileged call has to become a Safe
+transaction. `script/Admin.s.sol` builds them — one entry point per action —
+and does nothing else: no key, no broadcast, no signature. It simulates the
+call against current chain state first and refuses to print a proposal that
+would revert, then outputs the `to` / `value` / `data` triplet to paste into
+the Transaction Builder.
+
+```sh
+VAULT=0x… forge script script/Admin.s.sol --sig 'state()' --rpc-url base
+VAULT=0x… OPERATOR=0x… forge script script/Admin.s.sol --sig 'setOperator()' --rpc-url base
+```
+
+The point is that a proposal becomes a command line — reviewable in a PR,
+reproducible, and checked before four people are asked to approve it, rather
+than a form filled in once in a browser. The kill switch has its own
+ready-to-copy command in the `kill()` NatSpec; it is the only action where
+seconds count.
 
 ## Static analysis
 
