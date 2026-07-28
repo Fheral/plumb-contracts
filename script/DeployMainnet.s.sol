@@ -77,6 +77,14 @@ contract DeployMainnet is Script {
     /// @dev Largest single fill. A lot this size is the most one seller can concentrate on Plumb in
     ///      one go.
     uint128 constant MAX_SINGLE_FILL = 10_000e6;
+    /// @dev Absolute ceiling on the vault's NAV for the Phase 4 run — the only cap that is not a
+    ///      ratio, and therefore the only one that bounds what a bug can reach. 100k USDC is four
+    ///      times `MAX_UNITS` and ten times `MAX_SINGLE_FILL`: large enough that the book cap, the
+    ///      per-market cap and the fill cap are all reachable and get exercised for real, small
+    ///      enough to be a sum this desk is willing to lose entirely. Raised by the multisig once
+    ///      the external audit is in — that is the sequencing `PLAN.md` states, and until now
+    ///      nothing enforced it.
+    uint256 constant DEPOSIT_CAP = 100_000e6;
 
     /// @notice Everything that must be true before a single transaction is signed.
     ///
@@ -116,7 +124,15 @@ contract DeployMainnet is Script {
         // could set a policy of its own.
         QuoteModule quote = new QuoteModule(owner);
         PlumbVault vault = new PlumbVault(
-            "Plumb Exit Liquidity USDC", "plUSDC", USDC, address(MIDNIGHT), BLUE, address(quote), owner, feeRecipient
+            "Plumb Exit Liquidity USDC",
+            "plUSDC",
+            USDC,
+            address(MIDNIGHT),
+            BLUE,
+            address(quote),
+            owner,
+            feeRecipient,
+            DEPOSIT_CAP
         );
 
         // `touchMarket` is idempotent: the market exists on Base, the call returns its identifier.
@@ -179,6 +195,7 @@ contract DeployMainnet is Script {
         );
         console2.log(" 3. vault.setBlueMarket(...)               -- where the idle sleeve earns");
         console2.log(" 4. vault.setRiskParams(%s, %s)", MAX_BOOK_BPS, MAX_SINGLE_FILL);
+        console2.log("    (the deposit cap is already %s -- set in the constructor)", DEPOSIT_CAP);
         console2.log(" 5. vault.setOperator(operator)            -- the bot may quote from here on");
         console2.log(" 6. vault.openEpoch(budget)                -- LAST, and only when ready:");
         console2.log("    this is what starts the quoting. Nothing above it moves any capital.");

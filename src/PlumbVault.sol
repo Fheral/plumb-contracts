@@ -50,6 +50,14 @@ contract PlumbVault is ERC4626, Ownable2Step, Pausable, ReentrancyGuard, IBuyCal
 
     bytes32 internal constant CALLBACK_SUCCESS = keccak256("morpho.midnight.callbackSuccess");
     uint256 internal constant WAD = 1e18;
+    /// @dev Virtual decimals added to the share on top of the asset's own. See `_decimalsOffset`.
+    uint8 internal constant DECIMALS_OFFSET = 6;
+    /// @dev The share price of an untouched vault, in assets per 1e18 shares — the starting point
+    ///      of the high-water mark. It is `WAD` divided by the offset, not `WAD`: with virtual
+    ///      decimals a share is worth `1/10**offset` of an asset at inception, and seeding the mark
+    ///      at `WAD` would put it a million times above any price the vault can reach, which is a
+    ///      performance fee that is never charged again.
+    uint256 internal constant INITIAL_SHARE_PRICE = WAD / 10 ** DECIMALS_OFFSET;
     uint256 internal constant MAX_MARKETS = 8;
     uint256 public constant MAX_PERF_FEE_BPS = 2000;
     /// @notice Release period for a gain recognized ahead of schedule. See `lockedProfit()`.
@@ -84,7 +92,7 @@ contract PlumbVault is ERC4626, Ownable2Step, Pausable, ReentrancyGuard, IBuyCal
     uint256 public perfFeeBps = 1500;
     address public feeRecipient;
     /// @notice All-time high of the share price, in assets per 1e18 shares.
-    uint256 public highWaterMark = WAD;
+    uint256 public highWaterMark = INITIAL_SHARE_PRICE;
 
     /// @dev Gain recognized at the last `_lockProfit`, and the instant it was. The still-locked
     ///      portion decays linearly from that instant.
@@ -94,6 +102,16 @@ contract PlumbVault is ERC4626, Ownable2Step, Pausable, ReentrancyGuard, IBuyCal
     address public operator;
     BlueMarketParams public blueMarket;
     bool public blueMarketSet;
+
+    /// @notice Hard ceiling on the vault's NAV, enforced by `maxDeposit` / `maxMint`.
+    /// @dev Every other cap in this contract is *relative* — `maxBookBps` and `QuoteModule.maxUnits`
+    ///      bound the Midnight exposure as a share of the NAV, so they scale with whatever is
+    ///      deposited. None of them bounds the TVL itself, and the blast radius of a bug is
+    ///      proportional to the TVL, not to a ratio. This is the absolute one: it is what makes a
+    ///      "capped run" capped. Raised, and eventually lifted to `type(uint256).max`, once the
+    ///      external audit is in. Defaults to no cap so an existing deployment's behaviour is the
+    ///      one it had; the deployment script is what sets the opening value.
+    uint256 public depositCap = type(uint256).max;
 
     /// @notice Offer-budget epoch. Midnight's `consumed` counter is monotonic: to reclaim budget
     ///         you must change `group`, hence change epoch.
@@ -105,6 +123,7 @@ contract PlumbVault is ERC4626, Ownable2Step, Pausable, ReentrancyGuard, IBuyCal
     event SetRiskParams(uint256 maxBookBps, uint128 maxSingleFill);
     event SetFee(uint256 perfFeeBps, address indexed recipient);
     event SetBlueMarket(address collateralToken, address oracle, address irm, uint256 lltv);
+    event SetDepositCap(uint256 cap);
     event OpenEpoch(uint96 indexed epoch, bytes32 group, uint128 budget);
     event Killed(bytes32 group);
     event Bought(bytes32 indexed id, uint256 units, uint256 assets);
@@ -117,6 +136,7 @@ contract PlumbVault is ERC4626, Ownable2Step, Pausable, ReentrancyGuard, IBuyCal
     error NotMidnight();
     error NotSelf();
     error BlueMarketNotSet();
+    error BlueSleeveNotEmpty();
     error WrongLoanToken();
     error TooManyMarkets();
     error BookCapExceeded();
@@ -147,6 +167,11 @@ contract PlumbVault is ERC4626, Ownable2Step, Pausable, ReentrancyGuard, IBuyCal
     ///      every market is checked against `asset()`. The share name and symbol are the only
     ///      asset-specific values, so they are deployment parameters (e.g. "Plumb Exit Liquidity
     ///      USDC" / "plUSDC").
+    ///
+    ///      `depositCap_` is a constructor argument and not merely a setter call because ownership
+    ///      passes to the multisig in this very transaction: anything left to a follow-up call is
+    ///      uncapped for as long as that call takes to be proposed and signed, and the vault takes
+    ///      deposits from its first block. `type(uint256).max` deploys uncapped, deliberately.
     constructor(
         string memory name_,
         string memory symbol_,
@@ -155,9 +180,12 @@ contract PlumbVault is ERC4626, Ownable2Step, Pausable, ReentrancyGuard, IBuyCal
         address blue_,
         address quote_,
         address owner_,
-        address feeRecipient_
+        address feeRecipient_,
+        uint256 depositCap_
     ) ERC20(name_, symbol_) ERC4626(IERC20(asset_)) Ownable(owner_) {
         require(feeRecipient_ != address(0), ZeroAddress());
+        depositCap = depositCap_;
+        emit SetDepositCap(depositCap_);
         MIDNIGHT = IMidnight(midnight_);
         BLUE = IMorphoBlue(blue_);
         QUOTE = QuoteModule(quote_);
@@ -172,6 +200,24 @@ contract PlumbVault is ERC4626, Ownable2Step, Pausable, ReentrancyGuard, IBuyCal
     // -------------------------------------------------------------------------
     // Accounting
     // -------------------------------------------------------------------------
+
+    /// @dev Six decimals of virtual offset, on top of OpenZeppelin's virtual share and virtual
+    ///      asset. That default already makes the first-depositor inflation attack unprofitable —
+    ///      the attacker donates as much as it recovers — but "unprofitable" is a statement about
+    ///      an attacker's balance sheet, not about the victim's: the donation still lands on the
+    ///      victim, and the rounding margin is at its widest with no offset. Each decimal of offset
+    ///      divides what a rounding step is worth by ten, so six of them make the donation needed
+    ///      to move the share price by one unit a million times larger.
+    ///
+    ///      Six because the asset has six: shares end up with twelve decimals, i.e. the eighteen of
+    ///      a conventional token minus the six the asset already carries — one asset is one share
+    ///      scaled by 1e6 at inception, the usual convention for an ERC-4626 over a stablecoin.
+    ///
+    ///      Not a knob: an offset is only meaningful before the first deposit, since changing it
+    ///      would restate every existing share. It is fixed here, at deployment, for good.
+    function _decimalsOffset() internal pure override returns (uint8) {
+        return DECIMALS_OFFSET;
+    }
 
     /// @notice NAV = idle cash + Blue position + marked book value — minus the still-locked gain.
     function totalAssets() public view override returns (uint256) {
@@ -493,9 +539,23 @@ contract PlumbVault is ERC4626, Ownable2Step, Pausable, ReentrancyGuard, IBuyCal
         BLUE.supply(blueMarket, assets == type(uint256).max ? idleAssets() : assets, 0, address(this), "");
     }
 
+    /// @notice Pulls `assets` back from the Blue sleeve, or the whole position on `type(uint256).max`.
+    /// @dev The sentinel mirrors `supplyToBlue`, and it is not sugar: emptying the sleeve is a
+    ///      prerequisite of `setBlueMarket`, and the only expression of "all of it" that Blue's
+    ///      round-up on the asset-to-share conversion cannot reject is the share count itself.
     function withdrawFromBlue(uint256 assets) external onlyOperator {
         require(blueMarketSet, BlueMarketNotSet());
-        BLUE.withdraw(blueMarket, assets, 0, address(this), address(this));
+        if (assets == type(uint256).max) {
+            _emptyBlueSleeve();
+        } else {
+            BLUE.withdraw(blueMarket, assets, 0, address(this), address(this));
+        }
+    }
+
+    /// @dev Withdraws the vault's entire position on the current sleeve, in shares.
+    function _emptyBlueSleeve() internal {
+        uint256 shares = BLUE.supplyShares(blueMarket, address(this));
+        if (shares > 0) BLUE.withdraw(blueMarket, 0, shares, address(this), address(this));
     }
 
     // -------------------------------------------------------------------------
@@ -509,6 +569,28 @@ contract PlumbVault is ERC4626, Ownable2Step, Pausable, ReentrancyGuard, IBuyCal
         uint256 liquid = idleAssets() + _blueLiquidity();
         uint256 own = super.maxWithdraw(owner_);
         return own < liquid ? own : liquid;
+    }
+
+    /// @notice What the vault will actually take in. Zero while paused, and never more than the
+    ///         room left under `depositCap`.
+    /// @dev ERC-4626 requires `maxDeposit` to be zero when deposits are disabled, and the base
+    ///      implementation returns `type(uint256).max` unconditionally — so a paused vault, or a
+    ///      full one, promised an aggregator a deposit that `_deposit` would then revert on. The
+    ///      limit is measured against the NAV rather than a running total of inflows: a cap on the
+    ///      TVL is what is wanted, and inflows net of losses would drift away from it.
+    function maxDeposit(address) public view override returns (uint256) {
+        if (paused()) return 0;
+        uint256 cap = depositCap;
+        if (cap == type(uint256).max) return type(uint256).max;
+        uint256 nav = totalAssets();
+        return nav >= cap ? 0 : cap - nav;
+    }
+
+    function maxMint(address receiver) public view override returns (uint256) {
+        uint256 assets = maxDeposit(receiver);
+        // The cap is denominated in assets; its share image is what a deposit of that size would
+        // mint. Rounding down keeps `mint(maxMint(x))` inside the cap rather than one wei past it.
+        return assets == type(uint256).max ? type(uint256).max : _convertToShares(assets, Math.Rounding.Floor);
     }
 
     function maxRedeem(address owner_) public view override returns (uint256) {
@@ -591,17 +673,50 @@ contract PlumbVault is ERC4626, Ownable2Step, Pausable, ReentrancyGuard, IBuyCal
         emit OpenEpoch(epoch, currentGroup(), budget);
     }
 
+    /// @notice The brake on its own: stops deposits and stops ratifying, nothing else.
+    ///
+    /// @dev Separate from `kill()` on purpose. `kill()` is the complete gesture — it also exhausts
+    ///      the budget, which takes a call into Midnight — and a brake must not depend on a third
+    ///      party being in a state that lets it be pulled. This one reads no external contract and
+    ///      no epoch: it writes one bit of this vault's own storage, and there is no reachable
+    ///      state in which it cannot be written.
+    ///
+    ///      The asymmetry is the whole design: pausing closes the entrance and leaves the exit
+    ///      open. `_withdraw` is deliberately not gated — an emergency brake that locked depositors
+    ///      in would be worse than no brake at all.
+    ///
+    ///      Operator-callable, like `kill()`: the bot is the party that notices first, and the
+    ///      right it gains is the right to *stop* the vault, which is the direction in which a
+    ///      compromised bot key can do no more than deny service it could already deny by not
+    ///      quoting. Lifting the brake is another matter and stays the owner's alone.
+    function pause() external onlyOperator {
+        _pause();
+    }
+
     /// @notice Kill switch: exhausts the epoch's budget and pauses the vault.
     /// @dev One transaction is enough to pull every live offer, whatever their number.
+    ///
+    ///      The `setConsumed` call is skipped when there is nothing left to consume. Midnight
+    ///      accepts the write today (measured: `test_KillWorksOnAFullyConsumedBudget`), so this is
+    ///      not a workaround for a revert that exists — it is the removal of a dependency that has
+    ///      no reason to be there. A budget already spent to the last unit, or never opened at all,
+    ///      leaves no live offer to retire, and the brake should not be routed through a foreign
+    ///      contract to establish that. `pause()` covers what remains.
     function kill() external onlyOperator {
         bytes32 g = currentGroup();
-        MIDNIGHT.setConsumed(g, epochBudget, address(this));
+        if (remainingBudget() > 0) MIDNIGHT.setConsumed(g, epochBudget, address(this));
         _pause();
         emit Killed(g);
     }
 
     function unpause() external onlyOwner {
         _unpause();
+    }
+
+    /// @notice Caps the vault's NAV. `type(uint256).max` lifts the cap entirely.
+    function setDepositCap(uint256 newCap) external onlyOwner {
+        depositCap = newCap;
+        emit SetDepositCap(newCap);
     }
 
     /// @notice Appoints the operator. `address(0)` is valid: it is revocation, leaving the owner
@@ -611,8 +726,39 @@ contract PlumbVault is ERC4626, Ownable2Step, Pausable, ReentrancyGuard, IBuyCal
         emit SetOperator(newOperator);
     }
 
+    /// @notice Points the idle sleeve at a Morpho Blue market. Refuses to leave capital behind.
+    ///
+    /// @dev `blueAssets()` and `_blueLiquidity()` read whatever `blueMarket` holds at the instant
+    ///      they are called. Overwriting it while the old market still holds the sleeve therefore
+    ///      does not move any capital — it makes it invisible: three quarters of the NAV vanish
+    ///      from `totalAssets()` in the next block, the share price collapses, whoever deposits in
+    ///      that block buys at the broken price, and `maxWithdraw` reads about zero for everyone
+    ///      else. The funds are recoverable by pointing back; the arbitrage against the depositors
+    ///      is not.
+    ///
+    ///      Two answers, and both are here because they answer different questions. This guard is
+    ///      the one that makes the mistake unreachable: the setter is the primitive, it is what a
+    ///      hand-built Safe proposal will call, and it must be safe on its own terms.
+    ///      `migrateBlueMarket` is the one that makes the *correct* operation a single transaction,
+    ///      so that satisfying the guard never requires a window in which the sleeve sits idle
+    ///      between two proposals.
     function setBlueMarket(BlueMarketParams calldata p) external onlyOwner {
         require(p.loanToken == asset(), WrongLoanToken());
+        require(!blueMarketSet || blueAssets() == 0, BlueSleeveNotEmpty());
+        _setBlueMarket(p);
+    }
+
+    /// @notice Moves the idle sleeve to another Blue market in one transaction.
+    /// @dev Withdraw then re-supply, atomically: the NAV is the same on both sides of the call and
+    ///      no block ever sees the capital unaccounted for.
+    function migrateBlueMarket(BlueMarketParams calldata p) external onlyOwner nonReentrant {
+        require(p.loanToken == asset(), WrongLoanToken());
+        if (blueMarketSet) _emptyBlueSleeve();
+        _setBlueMarket(p);
+        BLUE.supply(blueMarket, idleAssets(), 0, address(this), "");
+    }
+
+    function _setBlueMarket(BlueMarketParams calldata p) internal {
         blueMarket = p;
         blueMarketSet = true;
         emit SetBlueMarket(p.collateralToken, p.oracle, p.irm, p.lltv);

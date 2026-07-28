@@ -4,7 +4,7 @@ pragma solidity 0.8.34;
 import {Test, console2} from "forge-std/Test.sol";
 import {IMidnight, Market, CollateralParams, Offer} from "../src/interfaces/midnight/IMidnight.sol";
 import {IdLib} from "../src/interfaces/midnight/IdLib.sol";
-import {BlueMarketParams} from "../src/interfaces/IMorphoBlue.sol";
+import {BlueMarketParams, IMorphoBlue} from "../src/interfaces/IMorphoBlue.sol";
 import {TickLib as TickLibView} from "../src/interfaces/midnight/TickLib.sol";
 
 interface IERC20Like {
@@ -95,6 +95,22 @@ abstract contract MidnightForkBase is Test {
         return BlueMarketParams({
             loanToken: address(USDC), collateralToken: WETH, oracle: ORACLE_WETH, irm: BLUE_IRM, lltv: BLUE_LLTV
         });
+    }
+
+    /// @notice A second, distinct Blue market on the same loan token — the destination of a sleeve
+    ///         migration.
+    /// @dev Same IRM and LLTV, different collateral, hence a different market id. Created on the
+    ///      fork rather than picked from Base, so the test does not depend on a second production
+    ///      market keeping its parameters. Supplying never reads the oracle, which is all this
+    ///      market is ever asked to do.
+    function otherBlueMarket() internal pure returns (BlueMarketParams memory) {
+        return BlueMarketParams({
+            loanToken: address(USDC), collateralToken: COLL2, oracle: ORACLE_COLL2, irm: BLUE_IRM, lltv: BLUE_LLTV
+        });
+    }
+
+    function _createOtherBlueMarket() internal {
+        IMorphoBlue(BLUE).createMarket(otherBlueMarket());
     }
 
     /// @dev Originates `units` of loan at an annualized `rateBps`: the borrower sells, `lender` buys.

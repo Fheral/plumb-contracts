@@ -8,6 +8,7 @@ import {PlumbVault} from "../src/PlumbVault.sol";
 import {QuoteModule} from "../src/QuoteModule.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {ERC4626} from "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
 
 interface IOracle2 {
     function price() external view returns (uint256);
@@ -32,7 +33,15 @@ contract PlumbAdversarialTest is MidnightForkBase {
         _forkSetUp();
         quote = new QuoteModule(OWNER);
         vault = new PlumbVault(
-            "Plumb Exit Liquidity USDC", "plUSDC", address(USDC), address(MIDNIGHT), BLUE, address(quote), OWNER, FEES
+            "Plumb Exit Liquidity USDC",
+            "plUSDC",
+            address(USDC),
+            address(MIDNIGHT),
+            BLUE,
+            address(quote),
+            OWNER,
+            FEES,
+            type(uint256).max
         );
 
         vm.startPrank(OWNER);
@@ -287,8 +296,13 @@ contract PlumbAdversarialTest is MidnightForkBase {
         vm.prank(OPERATOR);
         vault.kill();
 
+        // The refusal now comes from ERC-4626's own limit rather than from `Pausable`: a paused
+        // vault reports `maxDeposit == 0`, and `deposit` checks that before reaching `_deposit`.
+        // The standard requires exactly this — a vault that refuses deposits must say so in
+        // `maxDeposit`, so an aggregator never builds a transaction that is going to revert.
+        assertEq(vault.maxDeposit(ATTACKER), 0, "a paused vault must advertise no room");
         vm.prank(ATTACKER);
-        vm.expectRevert(Pausable.EnforcedPause.selector);
+        vm.expectRevert(abi.encodeWithSelector(ERC4626.ERC4626ExceededMaxDeposit.selector, ATTACKER, 1_000e6, 0));
         vault.deposit(1_000e6, ATTACKER);
 
         uint256 before = IERC20Like(address(USDC)).balanceOf(LP);

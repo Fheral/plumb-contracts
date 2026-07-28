@@ -49,7 +49,15 @@ contract PlumbWethMarketTest is MidnightForkBase {
 
         quote = new QuoteModule(OWNER);
         vault = new PlumbVault(
-            "Plumb Exit Liquidity WETH", "plWETH", WETH, address(MIDNIGHT), BLUE, address(quote), OWNER, FEES
+            "Plumb Exit Liquidity WETH",
+            "plWETH",
+            WETH,
+            address(MIDNIGHT),
+            BLUE,
+            address(quote),
+            OWNER,
+            FEES,
+            type(uint256).max
         );
 
         vm.startPrank(OWNER);
@@ -162,7 +170,10 @@ contract PlumbWethMarketTest is MidnightForkBase {
     }
 
     function test_FullLifecycleWeth() public {
-        assertEq(vault.decimals(), 18, "share decimals follow the asset");
+        // The virtual offset is a fixed six, whatever the asset carries: the share is always the
+        // asset's decimals plus six, so an 18-decimal asset gives 24-decimal shares. Uniform by
+        // choice — one rule to reason about, rather than an offset that depends on the token.
+        assertEq(vault.decimals(), 24, "share decimals are the asset's plus the offset");
         assertApproxEqAbs(vault.totalAssets(), 50e18, 2, "NAV in wei, cash parked on Blue");
         assertApproxEqAbs(vault.blueAssets(), 50e18, 2, "supplied to Blue on deposit");
 

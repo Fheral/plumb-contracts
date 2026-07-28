@@ -23,6 +23,15 @@ library BlueLib {
         return blue.expectedSupplyAssets(p, user);
     }
 
+    /// @notice The supply shares `user` holds on this market.
+    /// @dev Emptying a position has to be done in shares, not in assets: Blue converts assets to
+    ///      shares by rounding up, so a withdrawal of `expectedSupplyAssets` can ask for one share
+    ///      more than the position holds and revert. Withdrawing the shares themselves is the only
+    ///      expression of "all of it" that cannot be off by one.
+    function supplyShares(IMorphoBlue blue, BlueMarketParams memory p, address user) internal view returns (uint256) {
+        return blue.position(p.id(), user).supplyShares;
+    }
+
     /// @notice Liquidity actually withdrawable from the market at this instant.
     /// @dev What the vault holds is not enough: if borrowers have drawn everything, the withdrawal
     ///      reverts. This is the bound the bot must read before quoting.

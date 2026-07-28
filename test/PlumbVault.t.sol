@@ -23,7 +23,15 @@ contract PlumbVaultTest is MidnightForkBase {
 
         quote = new QuoteModule(OWNER);
         vault = new PlumbVault(
-            "Plumb Exit Liquidity USDC", "plUSDC", address(USDC), address(MIDNIGHT), BLUE, address(quote), OWNER, FEES
+            "Plumb Exit Liquidity USDC",
+            "plUSDC",
+            address(USDC),
+            address(MIDNIGHT),
+            BLUE,
+            address(quote),
+            OWNER,
+            FEES,
+            type(uint256).max
         );
 
         vm.startPrank(OWNER);

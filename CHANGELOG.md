@@ -15,6 +15,79 @@ below list it.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-07-29
+
+The pre-mainnet review's release. Nothing here is exploitable by a third party;
+everything here changes the deployed bytecode — the constructor signature
+included — which is why it lands before the first Base deployment rather than
+after it.
+
+### Added
+
+- `pause()` — the emergency brake on its own, `onlyOperator`. `kill()` was the
+  only path to `_pause()`, and it calls into Midnight first: a brake whose
+  availability depends on a third-party contract is not a brake. `pause()` reads
+  nothing external and writes one bit of this vault's own storage. `unpause()`
+  stays `onlyOwner`: stopping is cheap, restarting is a decision.
+
+  Measured first, and the answer settled the open question: `kill()` does *not*
+  revert on a budget spent to the last unit, nor with `epochBudget == 0`.
+  Midnight's `setConsumed` accepts the rewrite (`test_KillWorksOnAFullyConsumedBudget`,
+  `test_KillWorksBeforeAnyEpochIsOpened`). `kill()` now skips the `setConsumed`
+  call when there is nothing left to consume anyway — one less dependency, not a
+  workaround for a revert that does not exist.
+
+- `depositCap`, `setDepositCap` and the `maxDeposit`/`maxMint` overrides that
+  enforce it. Every other cap in the vault is a *ratio* — `maxBookBps`,
+  `QuoteModule.maxUnits` — and bounds the Midnight exposure, not the TVL, while
+  the blast radius of a bug is proportional to the TVL. This is the absolute
+  one, and it is what makes a capped run capped.
+
+  It is a **constructor argument**, not merely a setter: ownership passes to the
+  multisig in the deployment transaction, so anything left to a follow-up call
+  is uncapped for as long as that call takes to be signed, and the vault takes
+  deposits from its first block. `DeployMainnet` ships it at 100,000 USDC.
+
+- `migrateBlueMarket(p)` — moves the idle sleeve to another Blue market in one
+  transaction, so that satisfying the new `setBlueMarket` guard never requires a
+  window in which the sleeve sits idle between two Safe proposals.
+
+- `withdrawFromBlue(type(uint256).max)` empties the position, in shares. Blue
+  rounds the asset-to-share conversion up, so withdrawing
+  `expectedSupplyAssets` can ask for one share more than the position holds.
+
+
+### Changed
+
+- **Breaking (accounting)** — `_decimalsOffset()` is `6` instead of `0`. Shares
+  now carry the asset's decimals plus six (12 for USDC, 24 for an 18-decimal
+  asset), and one asset is `1e6` shares at inception. OpenZeppelin v5's virtual
+  shares already make the first-depositor inflation attack unprofitable, but
+  that is a statement about the attacker's balance sheet, not the victim's: the
+  donation still lands, and the rounding margin is widest with no offset. Each
+  decimal divides what a rounding step is worth by ten. **Not changeable after
+  the first deposit**, which is why it is here and not in a later release.
+
+  Consequence, and the reason this is Breaking: `highWaterMark` starts at
+  `WAD / 10**6`, not `WAD`. Seeded at `WAD` it would have sat a million times
+  above any reachable share price and **no performance fee would ever have been
+  charged**. Found by the test suite, not by reasoning.
+
+- **Breaking (policy)** — `setBlueMarket` refuses to overwrite a market that
+  still holds the sleeve (`BlueSleeveNotEmpty`). `blueAssets()` and
+  `_blueLiquidity()` read whatever `blueMarket` holds at the instant they are
+  called, so the old setter did not move capital — it made it invisible: about
+  three quarters of the NAV gone from `totalAssets()` in the next block, share
+  price collapsed, whoever deposits in that block buying at the broken price,
+  `maxWithdraw` at zero for everyone else.
+
+- **Breaking (ERC-4626)** — `maxDeposit` and `maxMint` return zero when the
+  vault is paused. They returned `type(uint256).max` while `_deposit` required
+  `!paused()`, which the standard forbids for exactly the reason it matters
+  here: an aggregator builds a transaction that reverts. The refusal on a paused
+  vault is now `ERC4626ExceededMaxDeposit`, not `EnforcedPause`.
+
+
 ## [0.2.0] — 2026-07-28
 
 The source cut for the Phase 4 capped mainnet run: the Base deployment and
@@ -43,6 +116,8 @@ addresses are listed here on release, once Phase 4 completes.
   that reverts, and prints the calldata. `state()` dumps what the two
   contracts hold today, which is what a parameter change has to be read
   against.
+
+
 
 ### Changed
 

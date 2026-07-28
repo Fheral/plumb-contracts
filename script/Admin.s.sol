@@ -42,6 +42,15 @@ contract Admin is Script {
         _propose(_vault(), abi.encodeCall(PlumbVault.unpause, ()), "vault.unpause()");
     }
 
+    /// @notice Caps the vault's NAV. `DEPOSIT_CAP` in the asset's own units.
+    /// @dev The cap the capped run rests on. Raised, and eventually set to `type(uint256).max`,
+    ///      once the external audit is in — that sequencing is the whole point of its existence.
+    function setDepositCap() external {
+        uint256 cap = vm.envUint("DEPOSIT_CAP");
+        console2.log("depositCap :", cap);
+        _propose(_vault(), abi.encodeCall(PlumbVault.setDepositCap, (cap)), "vault.setDepositCap(uint256)");
+    }
+
     /// @notice Rotates the bot's key. `OPERATOR=0x0` is revocation, not a mistake: it leaves the
     ///         owner alone entitled to open an epoch or pull the kill switch.
     function setOperator() external {
@@ -70,6 +79,27 @@ contract Admin is Script {
         console2.log("irm        :", p.irm);
         console2.log("lltv       :", p.lltv);
         _propose(vault, abi.encodeCall(PlumbVault.setBlueMarket, (p)), "vault.setBlueMarket(BlueMarketParams)");
+    }
+
+    /// @notice Moves an already-funded sleeve to another Blue market, atomically.
+    /// @dev Same five fields as `setBlueMarket`, and the one to use once the vault holds anything:
+    ///      the setter refuses to overwrite a market that still holds the sleeve, because doing so
+    ///      would not move the capital but hide it. This withdraws and re-supplies in one call.
+    function migrateBlueMarket() external {
+        PlumbVault vault = _vault();
+        BlueMarketParams memory p = BlueMarketParams({
+            loanToken: vault.asset(),
+            collateralToken: vm.envAddress("BLUE_COLLATERAL"),
+            oracle: vm.envAddress("BLUE_ORACLE"),
+            irm: vm.envAddress("BLUE_IRM"),
+            lltv: vm.envUint("BLUE_LLTV")
+        });
+        console2.log("loanToken  :", p.loanToken, "(the vault's asset, not read from env)");
+        console2.log("collateral :", p.collateralToken);
+        console2.log("oracle     :", p.oracle);
+        console2.log("irm        :", p.irm);
+        console2.log("lltv       :", p.lltv);
+        _propose(vault, abi.encodeCall(PlumbVault.migrateBlueMarket, (p)), "vault.migrateBlueMarket(BlueMarketParams)");
     }
 
     /// @notice Retunes the book cap (in bps of NAV) and the largest single fill accepted.
@@ -116,6 +146,13 @@ contract Admin is Script {
     ///      nothing to check anyway: `kill()` takes no argument.
     function kill() external {
         _propose(_vault(), abi.encodeCall(PlumbVault.kill, ()), "vault.kill()");
+    }
+
+    /// @notice The brake alone: stops deposits and stops ratifying, budget untouched.
+    /// @dev Also callable by the operator, which is the path an incident actually takes. This
+    ///      builds it as a proposal for the case where the owner pulls it directly.
+    function pause() external {
+        _propose(_vault(), abi.encodeCall(PlumbVault.pause, ()), "vault.pause()");
     }
 
     /// @notice Opens a new budget epoch. Every offer from the previous one dies.
@@ -201,6 +238,8 @@ contract Admin is Script {
         console2.log("perfFeeBps         :", vault.perfFeeBps());
         console2.log("feeRecipient       :", vault.feeRecipient());
         console2.log("totalAssets        :", vault.totalAssets());
+        console2.log("depositCap         :", vault.depositCap());
+        console2.log("maxDeposit         :", vault.maxDeposit(address(0)));
         console2.log("blueFloorMarginBps :", quote.blueFloorMarginBps());
         console2.log("continuousFeeCap   :", quote.continuousFeeCap());
     }

@@ -90,7 +90,8 @@ contract DeployMainnetScriptTest is MidnightForkBase {
             BLUE,
             address(quote),
             address(this),
-            FEES
+            FEES,
+            type(uint256).max
         );
         quote.setVault(address(vault));
         vault.setBlueMarket(script.blueMarket());

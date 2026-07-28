@@ -48,7 +48,15 @@ contract DeployLocal is Script {
 
         QuoteModule quote = new QuoteModule(deployer);
         PlumbVault vault = new PlumbVault(
-            "Plumb Exit Liquidity USDC", "plUSDC", USDC, address(MIDNIGHT), BLUE, address(quote), deployer, deployer
+            "Plumb Exit Liquidity USDC",
+            "plUSDC",
+            USDC,
+            address(MIDNIGHT),
+            BLUE,
+            address(quote),
+            deployer,
+            deployer,
+            type(uint256).max
         );
 
         // `touchMarket` is idempotent: the market already exists on Base, the call merely
