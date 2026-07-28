@@ -261,6 +261,78 @@ contract PlumbVaultTest is MidnightForkBase {
         assertLe(vault.bookValue() * 10_000, vault.totalAssets() * 6000, "book cap respected");
     }
 
+    /// @dev Does a fill of `unitsToTake` go through? Probed on a throwaway state.
+    function _fillSucceeds(uint256 unitsToTake) internal returns (bool ok) {
+        uint256 snap = vm.snapshotState();
+        Offer memory bid = vault.buildBid(midnightMarket(), type(uint256).max);
+        vm.prank(SELLER);
+        try MIDNIGHT.take(bid, "", unitsToTake, SELLER, SELLER, address(0), "") {
+            ok = true;
+        } catch {
+            ok = false;
+        }
+        vm.revertToState(snap);
+    }
+
+    /// @notice Pins down *how much* the book cap actually allows, not merely that it bites.
+    ///
+    /// @dev The cap is checked at `onBuy` after `b.value += buyerAssets`, so `bookValue()` already
+    ///      carries the purchase there, while `nav - buyerAssets` merely undoes the double count of
+    ///      cash that has not left the vault yet. The inequality is therefore
+    ///      `(book + x) * 1e4 <= nav * cap`, i.e. `x <= nav * cap / 1e4 - book`: remaining room is
+    ///      the gap between the maximum book and the current one, nothing more.
+    ///
+    ///      Reading the contract's line literally — current book against a NAV net of the purchase —
+    ///      yields `x <= nav - book * 1e4 / cap`, larger by a factor `1e4 / cap` (1.67x at 6000 bps).
+    ///      That reading is exactly the bug of issue #113: the offchain quoter advertised a size the
+    ///      vault would then refuse. This test is the guardrail against deriving it wrong again, so
+    ///      it asserts the boundary itself — the largest accepted fill, and the one unit past it.
+    function test_BookHeadroomIsExactlyReachable() public {
+        _originate(SELLER, 300_000e6, 370);
+        vm.warp(block.timestamp + 1 days);
+
+        // A first lot, so the headroom is measured against a book that is not empty.
+        _hitBid(40_000e6);
+
+        uint256 nav = vault.totalAssets();
+        uint256 book = vault.bookValue();
+        uint256 maxBook = (nav * 6000) / 10_000;
+        uint256 headroom = maxBook - book;
+        assertGt(headroom, 0, "the scenario must leave room");
+
+        // Largest fill the vault accepts, found by bisection rather than by reusing the formula
+        // under test. Every other cap is set well clear of this range, so the only binding
+        // constraint here is the book cap.
+        uint256 lo = 1;
+        uint256 hi = 150_000e6;
+        assertTrue(_fillSucceeds(lo), "the lower bound must pass");
+        assertTrue(!_fillSucceeds(hi), "the upper bound must fail");
+        while (hi - lo > 1) {
+            uint256 mid = (lo + hi) / 2;
+            if (_fillSucceeds(mid)) lo = mid;
+            else hi = mid;
+        }
+        uint256 maxUnits = lo;
+
+        // One unit past the boundary is refused, and refused *for the right reason*.
+        Offer memory bid = vault.buildBid(midnightMarket(), type(uint256).max);
+        vm.prank(SELLER);
+        vm.expectRevert(PlumbVault.BookCapExceeded.selector);
+        MIDNIGHT.take(bid, "", maxUnits + 1, SELLER, SELLER, address(0), "");
+
+        // The boundary itself goes through, and spends the headroom down to the last unit of price:
+        // capacity is `nav * cap / 1e4 - book`, not `nav - book * 1e4 / cap`.
+        uint256 paid = _hitBid(maxUnits);
+        assertLe(paid, headroom, "an accepted fill never spends more than the headroom");
+        uint256 unitPrice = quote.maxPrice(id, MATURITY, MIDNIGHT.tickSpacing(id));
+        assertLt(headroom - paid, (unitPrice / 1e18) + 2, "the headroom must be reachable, not merely an upper bound");
+        assertLe(vault.bookValue() * 10_000, vault.totalAssets() * 6000, "book cap respected at the boundary");
+
+        // The mis-derived formula would have advertised far more than that.
+        uint256 naiveHeadroom = nav - (book * 10_000) / 6000;
+        assertGt(naiveHeadroom, (headroom * 15) / 10, "the two readings must differ by the claimed factor");
+    }
+
     function test_MaxSingleFill() public {
         _originate(SELLER, 200_000e6, 370);
         vm.warp(block.timestamp + 1 days);
