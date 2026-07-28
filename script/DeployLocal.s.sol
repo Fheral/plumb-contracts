@@ -47,17 +47,22 @@ contract DeployLocal is Script {
         vm.startBroadcast(pk);
 
         QuoteModule quote = new QuoteModule(deployer);
-        PlumbVault vault = new PlumbVault(USDC, address(MIDNIGHT), BLUE, address(quote), deployer, deployer);
+        PlumbVault vault = new PlumbVault(
+            "Plumb Exit Liquidity USDC", "plUSDC", USDC, address(MIDNIGHT), BLUE, address(quote), deployer, deployer
+        );
 
         // `touchMarket` is idempotent: the market already exists on Base, the call merely
         // returns its identifier.
         bytes32 id = MIDNIGHT.touchMarket(_midnightMarket());
 
+        quote.setVault(address(vault));
         quote.setMarketConfig(
             id,
             QuoteModule.MarketConfig({
                 enabled: true,
                 rateBps: 900, // 9% annualized: in the middle of the [500, 3000] bounds
+                volSpreadBps: 150, // WETH collateral: a modest risk premium
+                skewBps: 400, // non-zero on purpose, so the local book exercises the skew
                 minTenor: 1 days,
                 maxTenor: 90 days,
                 maxUnits: 500_000e6
@@ -66,11 +71,7 @@ contract DeployLocal is Script {
 
         vault.setBlueMarket(
             BlueMarketParams({
-                loanToken: USDC,
-                collateralToken: WETH,
-                oracle: ORACLE_WETH,
-                irm: BLUE_IRM,
-                lltv: BLUE_LLTV
+                loanToken: USDC, collateralToken: WETH, oracle: ORACLE_WETH, irm: BLUE_IRM, lltv: BLUE_LLTV
             })
         );
         vault.setRiskParams(5_000, 100_000e6); // book capped at 50% of NAV

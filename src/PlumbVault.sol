@@ -142,11 +142,21 @@ contract PlumbVault is ERC4626, Ownable2Step, Pausable, ReentrancyGuard, IBuyCal
         _;
     }
 
-    constructor(address asset_, address midnight_, address blue_, address quote_, address owner_, address feeRecipient_)
-        ERC20("Plumb Exit Liquidity USDC", "plUSDC")
-        ERC4626(IERC20(asset_))
-        Ownable(owner_)
-    {
+    /// @dev One vault per loan asset, mirroring Midnight's own market structure. Nothing below
+    ///      assumes a specific token or decimal count: accounting is in the asset's raw units, and
+    ///      every market is checked against `asset()`. The share name and symbol are the only
+    ///      asset-specific values, so they are deployment parameters (e.g. "Plumb Exit Liquidity
+    ///      USDC" / "plUSDC").
+    constructor(
+        string memory name_,
+        string memory symbol_,
+        address asset_,
+        address midnight_,
+        address blue_,
+        address quote_,
+        address owner_,
+        address feeRecipient_
+    ) ERC20(name_, symbol_) ERC4626(IERC20(asset_)) Ownable(owner_) {
         require(feeRecipient_ != address(0), ZeroAddress());
         MIDNIGHT = IMidnight(midnight_);
         BLUE = IMorphoBlue(blue_);
@@ -218,6 +228,15 @@ contract PlumbVault is ERC4626, Ownable2Step, Pausable, ReentrancyGuard, IBuyCal
     function blueAssets() public view returns (uint256) {
         if (!blueMarketSet) return 0;
         return BLUE.expectedSupplyAssets(blueMarket, address(this));
+    }
+
+    /// @notice What the idle sleeve earns on Blue, annualized, in basis points.
+    /// @dev Read by `QuoteModule` as the floor on the bid rate: capital that sits on Blue already
+    ///      earns this, so a lot bought below it is a loss dressed up as a trade. Zero with no Blue
+    ///      market set — there is no opportunity cost to beat when the sleeve earns nothing.
+    function blueSupplyRateBps() public view returns (uint256) {
+        if (!blueMarketSet) return 0;
+        return BLUE.supplyRateBps(blueMarket);
     }
 
     /// @notice Sum of marked values, projected to the current instant without writing state.
@@ -356,11 +375,15 @@ contract PlumbVault is ERC4626, Ownable2Step, Pausable, ReentrancyGuard, IBuyCal
     /// @dev Midnight positions are already up to date when we enter here: `credit` includes the
     ///      units just bought. So we mark before folding in the lot, otherwise the new units would
     ///      accrete retroactively.
-    function onBuy(bytes32 id, Market memory market, uint256 buyerAssets, uint256 units, uint256, address buyer, bytes memory)
-        external
-        nonReentrant
-        returns (bytes32)
-    {
+    function onBuy(
+        bytes32 id,
+        Market memory market,
+        uint256 buyerAssets,
+        uint256 units,
+        uint256,
+        address buyer,
+        bytes memory
+    ) external nonReentrant returns (bytes32) {
         require(msg.sender == address(MIDNIGHT), NotMidnight());
         require(buyer == address(this), NotSelf());
         require(blueMarketSet, BlueMarketNotSet());

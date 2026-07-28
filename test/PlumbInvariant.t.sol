@@ -275,7 +275,9 @@ contract PlumbInvariantTest is MidnightForkBase {
         _forkSetUp();
 
         quote = new QuoteModule(OWNER);
-        vault = new PlumbVault(address(USDC), address(MIDNIGHT), BLUE, address(quote), OWNER, FEES);
+        vault = new PlumbVault(
+            "Plumb Exit Liquidity USDC", "plUSDC", address(USDC), address(MIDNIGHT), BLUE, address(quote), OWNER, FEES
+        );
 
         vm.startPrank(OWNER);
         vault.setBlueMarket(blueMarket());
@@ -284,6 +286,8 @@ contract PlumbInvariantTest is MidnightForkBase {
         vm.stopPrank();
 
         deal(WETH, BORROWER, 20_000e18);
+        vm.prank(OWNER);
+        quote.setVault(address(vault));
         for (uint256 k; k < N_MARKETS; ++k) {
             Market memory m = midnightMarket();
             m.rcfThreshold = 3e9 + k;
@@ -295,6 +299,8 @@ contract PlumbInvariantTest is MidnightForkBase {
                 QuoteModule.MarketConfig({
                     enabled: true,
                     rateBps: 900,
+                    volSpreadBps: 0,
+                    skewBps: 0,
                     minTenor: 1 days,
                     maxTenor: 90 days,
                     maxUnits: 500_000e6

@@ -22,14 +22,19 @@ contract PlumbVaultTest is MidnightForkBase {
         _forkSetUp();
 
         quote = new QuoteModule(OWNER);
-        vault = new PlumbVault(address(USDC), address(MIDNIGHT), BLUE, address(quote), OWNER, FEES);
+        vault = new PlumbVault(
+            "Plumb Exit Liquidity USDC", "plUSDC", address(USDC), address(MIDNIGHT), BLUE, address(quote), OWNER, FEES
+        );
 
         vm.startPrank(OWNER);
+        quote.setVault(address(vault));
         quote.setMarketConfig(
             id,
             QuoteModule.MarketConfig({
                 enabled: true,
                 rateBps: RATE_BPS,
+                volSpreadBps: 0,
+                skewBps: 0,
                 minTenor: 1 days,
                 maxTenor: 90 days,
                 maxUnits: 500_000e6
@@ -140,8 +145,15 @@ contract PlumbVaultTest is MidnightForkBase {
 
     function test_QuoteRejectsRateOutOfBounds() public {
         vm.startPrank(OWNER);
-        QuoteModule.MarketConfig memory c =
-            QuoteModule.MarketConfig({enabled: true, rateBps: 100, minTenor: 1 days, maxTenor: 90 days, maxUnits: 1e12});
+        QuoteModule.MarketConfig memory c = QuoteModule.MarketConfig({
+            enabled: true,
+            rateBps: 100,
+            volSpreadBps: 0,
+            skewBps: 0,
+            minTenor: 1 days,
+            maxTenor: 90 days,
+            maxUnits: 1e12
+        });
         vm.expectRevert(QuoteModule.RateOutOfBounds.selector);
         quote.setMarketConfig(id, c);
         c.rateBps = 5000;
@@ -157,6 +169,8 @@ contract PlumbVaultTest is MidnightForkBase {
             QuoteModule.MarketConfig({
                 enabled: true,
                 rateBps: RATE_BPS,
+                volSpreadBps: 0,
+                skewBps: 0,
                 minTenor: 1 days,
                 maxTenor: 30 days,
                 maxUnits: 500_000e6

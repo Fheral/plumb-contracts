@@ -29,14 +29,19 @@ contract PlumbDefaultTest is MidnightForkBase {
     function setUp() public {
         _forkSetUp();
         quote = new QuoteModule(OWNER);
-        vault = new PlumbVault(address(USDC), address(MIDNIGHT), BLUE, address(quote), OWNER, FEES);
+        vault = new PlumbVault(
+            "Plumb Exit Liquidity USDC", "plUSDC", address(USDC), address(MIDNIGHT), BLUE, address(quote), OWNER, FEES
+        );
 
         vm.startPrank(OWNER);
+        quote.setVault(address(vault));
         quote.setMarketConfig(
             id,
             QuoteModule.MarketConfig({
                 enabled: true,
                 rateBps: 900,
+                volSpreadBps: 0,
+                skewBps: 0,
                 minTenor: 1 days,
                 maxTenor: 90 days,
                 maxUnits: 500_000e6

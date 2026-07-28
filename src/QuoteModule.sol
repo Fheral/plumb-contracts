@@ -4,23 +4,52 @@ pragma solidity 0.8.34;
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {TickLib, MAX_TICK} from "./interfaces/midnight/TickLib.sol";
 
+/// @notice The vault state `QuoteModule` prices against.
+/// @dev Deliberately narrow: the quoting policy reads Plumb's own book and Plumb's own opportunity
+///      cost, nothing else. Declared as an interface rather than importing the vault to keep the
+///      dependency one-way at the type level.
+interface IQuoteContext {
+    function book(bytes32 id) external view returns (uint128 units, uint128 value, uint64 lastMark, uint64 maturity);
+    function blueSupplyRateBps() external view returns (uint256);
+}
+
 /// @notice Plumb's quoting policy.
 ///
 /// Converts a target annualized rate into a Midnight tick. This is the only place a price is
 /// decided: neither the operator nor the bot can choose a tick, they can only observe this one.
 ///
+/// The rate quoted is not the configured one. Three adjustments apply, in this order:
+///
+///  1. **Collateral spread** — a flat premium per market. A lot backed by cbBTC and a lot backed by
+///     an RWA do not carry the same default risk; a single target rate would price them alike,
+///     which is wrong in both directions.
+///  2. **Inventory skew** — the bid steps back as the market fills up. A cap alone says
+///     "yes, yes, yes, NO"; the skew says "yes, a little worse, distinctly worse". Self-limitation
+///     becomes progressive, and the seller pays for the concentration instead of the depositors
+///     wearing it.
+///  3. **Blue floor** — the rate can never fall below what the idle sleeve already earns on Morpho
+///     Blue, plus a margin. Buying a lot at 6% while Blue pays 7% destroys value; this makes that
+///     mistake structurally impossible rather than merely visible after the fact.
+///
 /// The target rate is hard-bounded by immutable constants. A compromised owner can therefore
-/// neither dump the book (rate > MAX) nor overpay for positions (rate < MIN).
+/// neither dump the book (rate > MAX) nor overpay for positions (rate < MIN). The adjustments
+/// preserve both bounds by construction: they are *additive and non-negative*, so they can only
+/// move the rate up — away from MIN, never past MAX, which is clamped.
 contract QuoteModule is Ownable2Step {
     /// @dev Immutable bounds on the annualized bid rate, in basis points.
     uint256 public constant MIN_RATE_BPS = 500; // 5%  — below this, Plumb does not take the duration risk
     uint256 public constant MAX_RATE_BPS = 3000; // 30% — above this, the counterparty is being fleeced
     uint256 public constant MAX_TENOR = 90 days;
+    /// @dev Upper bound on each adjustment. Not a risk limit — the MAX clamp is — but a guard
+    ///      against a fat-fingered config that would silently pin every market at MAX_RATE_BPS.
+    uint256 public constant MAX_ADJUSTMENT_BPS = 2000;
     uint256 internal constant WAD = 1e18;
 
     struct MarketConfig {
         bool enabled;
-        uint16 rateBps; // target annualized rate for this market
+        uint16 rateBps; // base target annualized rate for this market
+        uint16 volSpreadBps; // collateral risk premium, added flat
+        uint16 skewBps; // added in full when the market is at `maxUnits`, pro rata below
         uint32 minTenor; // below this, the gain covers neither gas nor settlement risk
         uint32 maxTenor; // above this, we refuse to carry the duration
         uint128 maxUnits; // cap on units held on this market
@@ -28,7 +57,16 @@ contract QuoteModule is Ownable2Step {
 
     mapping(bytes32 id => MarketConfig) internal _config;
 
+    /// @notice The vault whose book and opportunity cost this policy prices against.
+    IQuoteContext public vault;
+
+    /// @notice Margin required above Blue's supply rate, in basis points.
+    /// @dev Applies to every market: it prices Plumb's own illiquidity, not the collateral's risk.
+    uint256 public blueFloorMarginBps = 200;
+
     event SetMarketConfig(bytes32 indexed id, MarketConfig config);
+    event SetVault(address indexed vault);
+    event SetBlueFloorMargin(uint256 marginBps);
 
     error MarketDisabled();
     error RateOutOfBounds();
@@ -36,6 +74,11 @@ contract QuoteModule is Ownable2Step {
     error InvalidTenorRange();
     error InvalidSpacing();
     error NoAcceptableTick();
+    error AdjustmentOutOfBounds();
+    error ZeroMaxUnits();
+    error VaultNotSet();
+    error BelowBlueFloor();
+    error ZeroAddress();
 
     constructor(address owner_) Ownable(owner_) {}
 
@@ -46,16 +89,63 @@ contract QuoteModule is Ownable2Step {
     function setMarketConfig(bytes32 id, MarketConfig calldata c) external onlyOwner {
         if (c.enabled) {
             require(c.rateBps >= MIN_RATE_BPS && c.rateBps <= MAX_RATE_BPS, RateOutOfBounds());
+            require(c.volSpreadBps <= MAX_ADJUSTMENT_BPS && c.skewBps <= MAX_ADJUSTMENT_BPS, AdjustmentOutOfBounds());
             require(c.minTenor > 0 && c.minTenor < c.maxTenor, InvalidTenorRange());
             require(c.maxTenor <= MAX_TENOR, TenorOutOfBounds());
+            // The skew divides by `maxUnits`: a market enabled with a zero cap could not be priced.
+            require(c.maxUnits > 0, ZeroMaxUnits());
         }
         _config[id] = c;
         emit SetMarketConfig(id, c);
     }
 
+    /// @notice Points the policy at its vault. Set once, right after deployment.
+    /// @dev The vault takes the module's address in its constructor, so the link can only be closed
+    ///      from this side. Until it is, `maxTick` reverts rather than quoting an unskewed,
+    ///      unfloored price — failing closed is the whole point of the module.
+    function setVault(address newVault) external onlyOwner {
+        require(newVault != address(0), ZeroAddress());
+        vault = IQuoteContext(newVault);
+        emit SetVault(newVault);
+    }
+
+    function setBlueFloorMargin(uint256 marginBps) external onlyOwner {
+        require(marginBps <= MAX_ADJUSTMENT_BPS, AdjustmentOutOfBounds());
+        blueFloorMarginBps = marginBps;
+        emit SetBlueFloorMargin(marginBps);
+    }
+
+    /// @notice The annualized rate Plumb actually demands on this market at this instant, in bps.
+    /// @dev Exposed on its own because it is the number a human reads to understand a quote — the
+    ///      tick only says what it costs, not why.
+    function effectiveRateBps(bytes32 id) public view returns (uint256) {
+        MarketConfig memory c = _config[id];
+        require(c.enabled, MarketDisabled());
+        require(address(vault) != address(0), VaultNotSet());
+
+        (uint128 held,,,) = vault.book(id);
+        // Held units above the cap are possible after the owner lowers it: the skew saturates
+        // rather than overshooting, and the cap in `onBuy` refuses the fill anyway.
+        uint256 heldForSkew = held > c.maxUnits ? c.maxUnits : held;
+        uint256 skew = (uint256(c.skewBps) * heldForSkew) / c.maxUnits;
+
+        uint256 rate = uint256(c.rateBps) + c.volSpreadBps + skew;
+        if (rate > MAX_RATE_BPS) rate = MAX_RATE_BPS;
+
+        uint256 floorRate = vault.blueSupplyRateBps() + blueFloorMarginBps;
+        if (rate < floorRate) {
+            // Demanding more than MAX_RATE_BPS is not something this policy will do — that bound is
+            // the counterparty's protection. So when the idle sleeve out-earns anything Plumb may
+            // legitimately bid, Plumb does not bid at all.
+            require(floorRate <= MAX_RATE_BPS, BelowBlueFloor());
+            rate = floorRate;
+        }
+        return rate;
+    }
+
     /// @notice Highest tick (hence highest price) Plumb accepts to pay at this instant.
-    /// @dev The target price is the linear discounting of par at the target rate. Tick rounding is
-    ///      always downward: Plumb will never pay more than its target price, even if that means
+    /// @dev The target price is the linear discounting of par at the effective rate. Tick rounding
+    ///      is always downward: Plumb will never pay more than its target price, even if that means
     ///      quoting a notch too low and missing the trade.
     function maxTick(bytes32 id, uint256 maturity, uint8 spacing) public view returns (uint256) {
         MarketConfig memory c = _config[id];
@@ -65,8 +155,8 @@ contract QuoteModule is Ownable2Step {
         uint256 remaining = maturity > block.timestamp ? maturity - block.timestamp : 0;
         require(remaining >= c.minTenor && remaining <= c.maxTenor, TenorOutOfBounds());
 
-        uint256 discount = (uint256(c.rateBps) * WAD * remaining) / (10_000 * 365 days);
-        uint256 targetPrice = WAD - discount; // discount < WAD as long as rateBps <= 3000 and remaining <= 90d
+        uint256 discount = (effectiveRateBps(id) * WAD * remaining) / (10_000 * 365 days);
+        uint256 targetPrice = WAD - discount; // discount < WAD as long as rate <= 3000 and remaining <= 90d
 
         uint256 tick = TickLib.priceToTick(targetPrice, spacing);
         // priceToTick rounds up (price >= target). Step down one notch to stay under the target.

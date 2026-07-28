@@ -93,11 +93,7 @@ abstract contract MidnightForkBase is Test {
 
     function blueMarket() internal pure returns (BlueMarketParams memory) {
         return BlueMarketParams({
-            loanToken: address(USDC),
-            collateralToken: WETH,
-            oracle: ORACLE_WETH,
-            irm: BLUE_IRM,
-            lltv: BLUE_LLTV
+            loanToken: address(USDC), collateralToken: WETH, oracle: ORACLE_WETH, irm: BLUE_IRM, lltv: BLUE_LLTV
         });
     }
 

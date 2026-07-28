@@ -31,9 +31,12 @@ contract PlumbFuzzTest is MidnightForkBase {
         tenorAtFork = MATURITY - block.timestamp;
 
         quote = new QuoteModule(OWNER);
-        vault = new PlumbVault(address(USDC), address(MIDNIGHT), BLUE, address(quote), OWNER, FEES);
+        vault = new PlumbVault(
+            "Plumb Exit Liquidity USDC", "plUSDC", address(USDC), address(MIDNIGHT), BLUE, address(quote), OWNER, FEES
+        );
 
         vm.startPrank(OWNER);
+        quote.setVault(address(vault));
         _configure(900);
         vault.setBlueMarket(blueMarket());
         vault.setOperator(OPERATOR);
@@ -55,6 +58,8 @@ contract PlumbFuzzTest is MidnightForkBase {
             QuoteModule.MarketConfig({
                 enabled: true,
                 rateBps: uint16(rateBps),
+                volSpreadBps: 0,
+                skewBps: 0,
                 minTenor: 1 days,
                 maxTenor: 90 days,
                 maxUnits: 400_000e6
@@ -80,13 +85,16 @@ contract PlumbFuzzTest is MidnightForkBase {
 
         uint8 spacing = MIDNIGHT.tickSpacing(id);
         uint256 remaining = MATURITY - block.timestamp;
-        uint256 target = 1e18 - (uint256(rateBps) * 1e18 * remaining) / (10_000 * 365 days);
+        // The target is discounted at the *effective* rate, not the configured one: the Blue floor
+        // may legitimately have raised it. What must never happen is the effective rate coming out
+        // below the configured one — that would be the vault paying more than its own policy.
+        uint256 effective = quote.effectiveRateBps(id);
+        assertGe(effective, rateBps, "an adjustment can only raise the demanded rate");
+        uint256 target = 1e18 - (effective * 1e18 * remaining) / (10_000 * 365 days);
 
         uint256 tick = quote.maxTick(id, MATURITY, spacing);
         assertLe(TickLib.tickToPrice(tick), target, "Plumb must never quote above its target");
-        assertGt(
-            TickLib.tickToPrice(tick + spacing), target, "the next notch must exceed: the quote is tight"
-        );
+        assertGt(TickLib.tickToPrice(tick + spacing), target, "the next notch must exceed: the quote is tight");
     }
 
     /// @dev Property: outside the rate bounds, the config is refused. A compromised owner cannot
@@ -115,11 +123,7 @@ contract PlumbFuzzTest is MidnightForkBase {
             _tryBuy(units);
 
             // The invariant is re-read from public state, assuming nothing about the path taken.
-            assertLe(
-                vault.bookValue() * 10_000,
-                vault.totalAssets() * vault.maxBookBps(),
-                "the book exceeds its cap"
-            );
+            assertLe(vault.bookValue() * 10_000, vault.totalAssets() * vault.maxBookBps(), "the book exceeds its cap");
             assertLe(vault.bookValue(), vault.totalAssets(), "the book cannot exceed NAV");
         }
         // Without a completed buy, everything above is `0 <= X`.
@@ -172,10 +176,8 @@ contract PlumbFuzzTest is MidnightForkBase {
     /// @dev Expected refusals: Plumb's caps, and Midnight's counters when a sequence replays an
     ///      already consumed budget.
     function _isExpectedRefusal(bytes memory err) internal pure returns (bool) {
-        return _contains(err, PlumbVault.BookCapExceeded.selector)
-            || _contains(err, PlumbVault.FillTooLarge.selector)
-            || _contains(err, PlumbVault.TooManyMarkets.selector)
-            || _contains(err, IMidnight.ConsumedUnits.selector)
+        return _contains(err, PlumbVault.BookCapExceeded.selector) || _contains(err, PlumbVault.FillTooLarge.selector)
+            || _contains(err, PlumbVault.TooManyMarkets.selector) || _contains(err, IMidnight.ConsumedUnits.selector)
             || _contains(err, IMidnight.AlreadyConsumed.selector)
             || _contains(err, IMidnight.TickNotAccessible.selector);
     }

@@ -39,7 +39,9 @@ contract PlumbMultiMarketTest is MidnightForkBase {
         _forkSetUp();
 
         quote = new QuoteModule(OWNER);
-        vault = new PlumbVault(address(USDC), address(MIDNIGHT), BLUE, address(quote), OWNER, FEES);
+        vault = new PlumbVault(
+            "Plumb Exit Liquidity USDC", "plUSDC", address(USDC), address(MIDNIGHT), BLUE, address(quote), OWNER, FEES
+        );
 
         vm.startPrank(OWNER);
         vault.setBlueMarket(blueMarket());
@@ -49,6 +51,8 @@ contract PlumbMultiMarketTest is MidnightForkBase {
 
         // 9 markets: 8 to fill, the 9th to prove the cap refuses.
         deal(WETH, BORROWER, 20_000e18);
+        vm.prank(OWNER);
+        quote.setVault(address(vault));
         for (uint256 i; i <= N; ++i) {
             Market memory m = _variant(i);
             bytes32 mid = MIDNIGHT.touchMarket(m);
@@ -60,6 +64,8 @@ contract PlumbMultiMarketTest is MidnightForkBase {
                 QuoteModule.MarketConfig({
                     enabled: true,
                     rateBps: RATE_BPS,
+                    volSpreadBps: 0,
+                    skewBps: 0,
                     minTenor: 1 days,
                     maxTenor: 90 days,
                     maxUnits: 500_000e6
@@ -213,9 +219,7 @@ contract PlumbMultiMarketTest is MidnightForkBase {
     function test_BookCapIsGlobalAcrossMarkets() public {
         for (uint256 k; k < N; ++k) {
             _fill(k);
-            assertLe(
-                vault.bookValue() * 10_000, vault.totalAssets() * vault.maxBookBps(), "global cap exceeded"
-            );
+            assertLe(vault.bookValue() * 10_000, vault.totalAssets() * vault.maxBookBps(), "global cap exceeded");
         }
 
         // 8 lots of 12k against a 400k NAV: we are under 60%. We tighten the cap below the
