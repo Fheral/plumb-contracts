@@ -15,6 +15,14 @@ below list it.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-07-28
+
+The source cut for the Phase 4 capped mainnet run: the Base deployment and
+admin tooling, plus two breaking corrections to how Midnight's continuous fee
+is bounded and accounted for. Still **not deployed** — cutting this release is
+what keeps the public mirror matching the bytecode that goes on-chain; mainnet
+addresses are listed here on release, once Phase 4 completes.
+
 ### Added
 
 - `script/DeployMainnet.s.sol` — the Base deployment. Deploys the vault and the
@@ -103,5 +111,6 @@ come first.
 None yet. Mainnet addresses will be listed here, per release, once Phase 4
 completes.
 
-[Unreleased]: https://github.com/Fheral/plumb-contracts/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Fheral/plumb-contracts/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Fheral/plumb-contracts/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Fheral/plumb-contracts/releases/tag/v0.1.0
