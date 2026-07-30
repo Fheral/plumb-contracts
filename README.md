@@ -160,6 +160,19 @@ it does not see the loss until an `updatePosition` has run. Any read of the
 book — here as well as on the monitoring side — must go through
 `updatePositionView`.
 
+## Deployed on Base
+
+| Contract | Address |
+|----------|---------|
+| PlumbVault (ERC-4626, USDC) | [`0x6462018b69f728d75df633AbC67d01d41578944D`](https://basescan.org/address/0x6462018b69f728d75df633AbC67d01d41578944D) |
+| QuoteModule | [`0xC50B4F7887eF46F9E279798aB6DD9870aa367b5A`](https://basescan.org/address/0xC50B4F7887eF46F9E279798aB6DD9870aa367b5A) |
+| Operator (bot key — quotes only, no funds) | [`0xE9513DD76b8f265Ff2ca1eA94d5070ed5F19DcBB`](https://basescan.org/address/0xE9513DD76b8f265Ff2ca1eA94d5070ed5F19DcBB) |
+
+Market id: `0x9b7fed2a6b24c47b8995dfa4fb2b4bc87fe245c10fb842865e568611a96804aa`.
+The vault is governed by a multisig from its first block. It is deployed and
+wired, but does not quote yet: `openEpoch` — the last, deliberate step — has not
+been called.
+
 ## Status
 
 Development phases 1–3 are complete (vault, pricing policy, offchain
