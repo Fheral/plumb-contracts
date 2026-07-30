@@ -164,8 +164,8 @@ book — here as well as on the monitoring side — must go through
 
 | Contract | Address |
 |----------|---------|
-| PlumbVault (ERC-4626, USDC) | [`0x6462018b69f728d75df633AbC67d01d41578944D`](https://basescan.org/address/0x6462018b69f728d75df633AbC67d01d41578944D) |
-| QuoteModule | [`0xC50B4F7887eF46F9E279798aB6DD9870aa367b5A`](https://basescan.org/address/0xC50B4F7887eF46F9E279798aB6DD9870aa367b5A) |
+| PlumbVault (ERC-4626, USDC) | [`0xc57C5D7f73f3C0e2d84cb545D8c60f98B6E52648`](https://basescan.org/address/0xc57C5D7f73f3C0e2d84cb545D8c60f98B6E52648) |
+| QuoteModule | [`0x4f380a37071eAC1453A0d84F4eEaa2bE0c88793f`](https://basescan.org/address/0x4f380a37071eAC1453A0d84F4eEaa2bE0c88793f) |
 | Operator (bot key — quotes only, no funds) | [`0xE9513DD76b8f265Ff2ca1eA94d5070ed5F19DcBB`](https://basescan.org/address/0xE9513DD76b8f265Ff2ca1eA94d5070ed5F19DcBB) |
 
 Market id: `0x9b7fed2a6b24c47b8995dfa4fb2b4bc87fe245c10fb842865e568611a96804aa`.
