@@ -138,44 +138,65 @@ contract AdminScriptTest is MidnightForkBase {
         assertEq(vault.epochBudget(), 300_000e6);
     }
 
-    function test_MarketConfigProposesTheWholePolicy() public {
-        vm.setEnv("MARKET_ID", vm.toString(id));
-        vm.setEnv("ENABLED", "true");
+    function test_BasePolicyProposesTheWholePolicy() public {
         vm.setEnv("RATE_BPS", "900");
-        vm.setEnv("VOL_SPREAD_BPS", "150");
         vm.setEnv("SKEW_BPS", "400");
         vm.setEnv("MIN_TENOR", "86400");
         vm.setEnv("MAX_TENOR", "7776000");
-        vm.setEnv("MAX_UNITS", "25000000000");
+        vm.setEnv("MAX_UNITS_BPS", "2500");
 
-        admin.setMarketConfig();
+        admin.setBasePolicy();
         _execute(
             address(quote),
             abi.encodeCall(
-                QuoteModule.setMarketConfig,
-                (
-                    id,
-                    QuoteModule.MarketConfig({
-                        enabled: true,
-                        rateBps: 900,
-                        volSpreadBps: 150,
-                        skewBps: 400,
-                        minTenor: 1 days,
-                        maxTenor: 90 days,
-                        maxUnits: 25_000e6
-                    })
-                )
+                QuoteModule.setBasePolicy,
+                (QuoteModule.BasePolicy({
+                        rateBps: 900, skewBps: 400, minTenor: 1 days, maxTenor: 90 days, maxUnitsBps: 2_500
+                    }))
             )
         );
 
-        QuoteModule.MarketConfig memory c = quote.config(id);
-        assertTrue(c.enabled);
-        assertEq(c.rateBps, 900);
+        QuoteModule.BasePolicy memory p = quote.basePolicy();
+        assertEq(p.rateBps, 900);
+        assertEq(p.skewBps, 400);
+        assertEq(p.minTenor, 1 days);
+        assertEq(p.maxTenor, 90 days);
+        assertEq(p.maxUnitsBps, 2_500);
+    }
+
+    /// @dev The proposal that actually selects markets. Approving a collateral makes every Midnight
+    ///      market built on it quotable — which is why it goes through the multisig and a per-market
+    ///      call does not exist to go through it.
+    function test_CollateralPolicyProposesTheApproval() public {
+        vm.setEnv("COLLATERAL_TOKEN", vm.toString(WETH));
+        vm.setEnv("ALLOWED", "true");
+        vm.setEnv("VOL_SPREAD_BPS", "150");
+        vm.setEnv("MAX_LLTV", "860000000000000000");
+
+        admin.setCollateralPolicy();
+        _execute(
+            address(quote),
+            abi.encodeCall(
+                QuoteModule.setCollateralPolicy,
+                (WETH, QuoteModule.CollateralPolicy({allowed: true, volSpreadBps: 150, maxLltv: 0.86e18}))
+            )
+        );
+
+        QuoteModule.CollateralPolicy memory c = quote.collateralPolicy(WETH);
+        assertTrue(c.allowed);
         assertEq(c.volSpreadBps, 150);
-        assertEq(c.skewBps, 400);
-        assertEq(c.minTenor, 1 days);
-        assertEq(c.maxTenor, 90 days);
-        assertEq(c.maxUnits, 25_000e6);
+        assertEq(c.maxLltv, 0.86e18);
+    }
+
+    /// @dev The escape hatch, which can only ever remove.
+    function test_BlockedProposesTheRefusal() public {
+        vm.setEnv("MARKET_ID", vm.toString(id));
+        vm.setEnv("BLOCKED", "true");
+
+        admin.setBlocked();
+        _execute(address(quote), abi.encodeCall(QuoteModule.setBlocked, (id, true)));
+
+        assertTrue(quote.blocked(id));
     }
 
     function test_ContinuousFeeCapProposesTheCap() public {

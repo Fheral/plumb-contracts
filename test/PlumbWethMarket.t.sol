@@ -62,31 +62,14 @@ contract PlumbWethMarketTest is MidnightForkBase {
 
         vm.startPrank(OWNER);
         quote.setVault(address(vault));
-        quote.setMarketConfig(
-            wid,
-            QuoteModule.MarketConfig({
-                enabled: true,
-                rateBps: RATE_BPS,
-                volSpreadBps: 0,
-                skewBps: 0,
-                minTenor: 1 days,
-                maxTenor: 90 days,
-                maxUnits: 200e18
-            })
-        );
-        // The USDC fixture market is also enabled so that `test_RejectsForeignLoanToken` gets
-        // past the quote config and fails on the loan-token check, which is the one under test.
-        quote.setMarketConfig(
-            id,
-            QuoteModule.MarketConfig({
-                enabled: true,
-                rateBps: RATE_BPS,
-                volSpreadBps: 0,
-                skewBps: 0,
-                minTenor: 1 days,
-                maxTenor: 90 days,
-                maxUnits: 500_000e6
-            })
+        // `_configurePolicy` approves the USDC fixture's collateral (WETH + COLL2), which is what
+        // `test_RejectsForeignLoanToken` needs: that market must get past eligibility and fail on
+        // the loan-token check, the one actually under test.
+        _configurePolicy(quote, uint16(RATE_BPS));
+        // This vault lends WETH against USDC, so USDC is the collateral to approve here. The two
+        // fixtures invert each other, which is the whole point of running both.
+        quote.setCollateralPolicy(
+            address(USDC), QuoteModule.CollateralPolicy({allowed: true, volSpreadBps: 0, maxLltv: 0.86e18})
         );
         vault.setBlueMarket(blueWethMarket());
         vault.setOperator(OPERATOR);

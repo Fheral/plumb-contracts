@@ -20,6 +20,12 @@ contract BlueRateStub {
     function book(bytes32) external pure returns (uint128, uint128, uint64, uint64) {
         return (0, 0, 0, 0);
     }
+
+    /// @dev Any nonzero NAV: the per-market cap is a fraction of it, and only has to be nonzero for
+    ///      the skew to divide. This stub's book is empty, so the skew is zero either way.
+    function totalAssets() external pure returns (uint256) {
+        return 1_000_000e6;
+    }
 }
 
 /// @notice The bid is not a constant.
@@ -42,7 +48,8 @@ contract PlumbQuoteDynamicTest is MidnightForkBase {
 
     uint16 constant RATE_BPS = 1500; // well clear of the Blue floor, so the skew is what moves
     uint16 constant SKEW_BPS = 600;
-    uint128 constant MARKET_CAP = 100_000e6;
+    /// @dev 20% of the 500k deposit below: the same 100k the absolute cap used to name.
+    uint16 constant MARKET_CAP_BPS = 2_000;
     uint128 constant BUDGET = 300_000e6;
 
     function setUp() public {
@@ -79,18 +86,18 @@ contract PlumbQuoteDynamicTest is MidnightForkBase {
     }
 
     function _configure(uint16 rateBps, uint16 volSpreadBps, uint16 skewBps) internal {
-        quote.setMarketConfig(
-            id,
-            QuoteModule.MarketConfig({
-                enabled: true,
-                rateBps: rateBps,
-                volSpreadBps: volSpreadBps,
-                skewBps: skewBps,
-                minTenor: 1 days,
-                maxTenor: 90 days,
-                maxUnits: MARKET_CAP
+        quote.setBasePolicy(
+            QuoteModule.BasePolicy({
+                rateBps: rateBps, skewBps: skewBps, minTenor: 1 days, maxTenor: 90 days, maxUnitsBps: MARKET_CAP_BPS
             })
         );
+        _allowFixtureCollateral(quote, volSpreadBps);
+    }
+
+    /// @dev The per-market cap is a fraction of NAV now, so the tests read it rather than restating
+    ///      it: an assertion against a constant would drift the moment the sleeve accrues on Blue.
+    function _marketCap() internal view returns (uint256) {
+        return quote.marketUnitCap(vault.totalAssets());
     }
 
     /// @dev The seller originates a loan then hands `units` to Plumb at its own bid.
@@ -102,7 +109,7 @@ contract PlumbQuoteDynamicTest is MidnightForkBase {
     }
 
     function _tick() internal view returns (uint256) {
-        return quote.maxTick(id, MATURITY, MIDNIGHT.tickSpacing(id));
+        return quote.maxTick(midnightMarket(), MIDNIGHT.tickSpacing(id));
     }
 
     // -------------------------------------------------------------------------
@@ -115,18 +122,18 @@ contract PlumbQuoteDynamicTest is MidnightForkBase {
     ///      approach to it is now priced: each lot is bought a little cheaper than the last, so
     ///      concentration is paid for by the seller who causes it rather than worn by depositors.
     function test_SkewMovesTheBidAsTheBookFills() public {
-        uint256 rateEmpty = quote.effectiveRateBps(id);
+        uint256 rateEmpty = quote.effectiveRateBps(midnightMarket());
         uint256 tickEmpty = _tick();
         assertEq(rateEmpty, RATE_BPS, "an empty book must quote the configured rate exactly");
 
         _hitBid(25_000e6); // a quarter of the market cap
-        uint256 rateQuarter = quote.effectiveRateBps(id);
+        uint256 rateQuarter = quote.effectiveRateBps(midnightMarket());
         uint256 tickQuarter = _tick();
 
         // A different size on purpose: `_originate` derives its offer group from the size and the
         // timestamp, and reusing both in the same block would exhaust the group's budget.
         _hitBid(30_000e6);
-        uint256 rateHalf = quote.effectiveRateBps(id);
+        uint256 rateHalf = quote.effectiveRateBps(midnightMarket());
         uint256 tickHalf = _tick();
 
         console2.log("rate empty / quarter / half (bps)", rateEmpty, rateQuarter, rateHalf);
@@ -141,7 +148,7 @@ contract PlumbQuoteDynamicTest is MidnightForkBase {
         // of slack for the truncated division.
         uint256 heldQuarter = _heldUnits();
         assertApproxEqAbs(
-            rateQuarter, RATE_BPS + (uint256(SKEW_BPS) * 25_000e6) / MARKET_CAP, 1, "the skew must be pro rata"
+            rateQuarter, RATE_BPS + (uint256(SKEW_BPS) * 25_000e6) / _marketCap(), 1, "the skew must be pro rata"
         );
         assertGt(heldQuarter, 0, "the book must actually hold units");
     }
@@ -170,25 +177,21 @@ contract PlumbQuoteDynamicTest is MidnightForkBase {
     }
 
     /// @notice Held units above the cap saturate the skew rather than overshooting it.
-    /// @dev Reachable in one move: the owner lowers `maxUnits` under a book already built.
+    /// @dev Reachable in one move: the owner lowers the cap under a book already built. It is also
+    ///      reachable without anyone acting, since the cap follows the NAV — a drawdown shrinks it
+    ///      under a book that has not moved.
     function test_SkewSaturatesWhenHeldExceedsTheCap() public {
         _hitBid(60_000e6);
 
+        // 1% of a 500k NAV is 5k, well under the 60k already held.
         vm.prank(OWNER);
-        quote.setMarketConfig(
-            id,
-            QuoteModule.MarketConfig({
-                enabled: true,
-                rateBps: RATE_BPS,
-                volSpreadBps: 0,
-                skewBps: SKEW_BPS,
-                minTenor: 1 days,
-                maxTenor: 90 days,
-                maxUnits: 10_000e6 // now well below what is held
+        quote.setBasePolicy(
+            QuoteModule.BasePolicy({
+                rateBps: RATE_BPS, skewBps: SKEW_BPS, minTenor: 1 days, maxTenor: 90 days, maxUnitsBps: 100
             })
         );
 
-        assertEq(quote.effectiveRateBps(id), RATE_BPS + SKEW_BPS, "the skew must saturate, not overshoot");
+        assertEq(quote.effectiveRateBps(midnightMarket()), RATE_BPS + SKEW_BPS, "the skew must saturate, not overshoot");
     }
 
     // -------------------------------------------------------------------------
@@ -212,10 +215,11 @@ contract PlumbQuoteDynamicTest is MidnightForkBase {
 
         // Configure deliberately below Blue: the mistake the floor exists to make impossible.
         uint16 minRate = uint16(quote.MIN_RATE_BPS());
-        vm.prank(OWNER);
+        vm.startPrank(OWNER);
         _configure(minRate, 0, 0);
+        vm.stopPrank();
 
-        uint256 effective = quote.effectiveRateBps(id);
+        uint256 effective = quote.effectiveRateBps(midnightMarket());
         assertEq(effective, blueRate + margin, "under the floor, the floor is what is demanded");
         assertGt(effective, blueRate, "Plumb must never bid at or below its own opportunity cost");
     }
@@ -224,7 +228,9 @@ contract PlumbQuoteDynamicTest is MidnightForkBase {
     function test_FloorDoesNotTouchARateAlreadyAboveIt() public view {
         uint256 blueRate = vault.blueSupplyRateBps();
         assertGt(RATE_BPS, blueRate + quote.blueFloorMarginBps(), "test premise: the configured rate clears the floor");
-        assertEq(quote.effectiveRateBps(id), RATE_BPS, "a rate above the floor must pass through untouched");
+        assertEq(
+            quote.effectiveRateBps(midnightMarket()), RATE_BPS, "a rate above the floor must pass through untouched"
+        );
     }
 
     /// @notice When Blue out-earns anything Plumb may legitimately bid, Plumb stops quoting.
@@ -236,13 +242,13 @@ contract PlumbQuoteDynamicTest is MidnightForkBase {
         vm.mockCall(address(vault), abi.encodeWithSignature("blueSupplyRateBps()"), abi.encode(uint256(3500)));
 
         vm.expectRevert(QuoteModule.BelowBlueFloor.selector);
-        quote.effectiveRateBps(id);
+        quote.effectiveRateBps(midnightMarket());
 
         // The spacing read is hoisted: a nested external call in an argument list consumes the
         // pending `expectRevert`.
         uint8 spacing = MIDNIGHT.tickSpacing(id);
         vm.expectRevert(QuoteModule.BelowBlueFloor.selector);
-        quote.maxTick(id, MATURITY, spacing);
+        quote.maxTick(midnightMarket(), spacing);
 
         // And the vault refuses the offer that a bot might still be broadcasting.
         vm.expectRevert(QuoteModule.BelowBlueFloor.selector);
@@ -259,10 +265,11 @@ contract PlumbQuoteDynamicTest is MidnightForkBase {
     function test_VolSpreadPricesCollateralRisk() public {
         uint256 tickPlain = _tick();
 
-        vm.prank(OWNER);
+        vm.startPrank(OWNER);
         _configure(RATE_BPS, 400, SKEW_BPS);
+        vm.stopPrank();
 
-        assertEq(quote.effectiveRateBps(id), RATE_BPS + 400, "the spread must add to the demanded rate");
+        assertEq(quote.effectiveRateBps(midnightMarket()), RATE_BPS + 400, "the spread must add to the demanded rate");
         assertLt(_tick(), tickPlain, "a riskier collateral must be bid lower");
     }
 
@@ -279,8 +286,9 @@ contract PlumbQuoteDynamicTest is MidnightForkBase {
         vol = uint16(bound(vol, 0, quote.MAX_ADJUSTMENT_BPS()));
         skew = uint16(bound(skew, 0, quote.MAX_ADJUSTMENT_BPS()));
 
-        vm.prank(OWNER);
+        vm.startPrank(OWNER);
         _configure(rateBps, vol, skew);
+        vm.stopPrank();
 
         // The book is mocked rather than filled: this property is about arithmetic, and filling
         // would bound `held` to what the cap and the NAV allow.
@@ -290,40 +298,38 @@ contract PlumbQuoteDynamicTest is MidnightForkBase {
             abi.encode(held, uint128(0), uint64(0), uint64(MATURITY))
         );
 
-        uint256 effective = quote.effectiveRateBps(id);
+        uint256 effective = quote.effectiveRateBps(midnightMarket());
         assertGe(effective, quote.MIN_RATE_BPS(), "the rate can never fall under the immutable floor");
         assertLe(effective, quote.MAX_RATE_BPS(), "the rate can never exceed the immutable ceiling");
         assertGe(effective, rateBps, "an adjustment can only raise the demanded rate");
     }
 
-    /// @notice A rate configured above the adjustment bounds is refused outright.
+    /// @notice An adjustment configured above the bounds is refused outright — on either half of
+    ///         the policy, since the two adjustments now live in different setters.
     function test_OwnerCannotConfigureAnUnboundedAdjustment() public {
         uint16 tooMuch = uint16(quote.MAX_ADJUSTMENT_BPS() + 1);
 
-        vm.prank(OWNER);
+        vm.startPrank(OWNER);
         vm.expectRevert(QuoteModule.AdjustmentOutOfBounds.selector);
-        _configure(RATE_BPS, tooMuch, 0);
+        quote.setCollateralPolicy(
+            WETH, QuoteModule.CollateralPolicy({allowed: true, volSpreadBps: tooMuch, maxLltv: 0.86e18})
+        );
 
-        vm.prank(OWNER);
         vm.expectRevert(QuoteModule.AdjustmentOutOfBounds.selector);
-        _configure(RATE_BPS, 0, tooMuch);
+        quote.setBasePolicy(
+            QuoteModule.BasePolicy({
+                rateBps: RATE_BPS, skewBps: tooMuch, minTenor: 1 days, maxTenor: 90 days, maxUnitsBps: MARKET_CAP_BPS
+            })
+        );
+        vm.stopPrank();
     }
 
-    /// @notice An enabled market with no cap cannot be priced, so it cannot be configured.
-    function test_EnabledMarketNeedsANonZeroCap() public {
+    /// @notice A policy with no per-market cap cannot price the skew, so it cannot be set.
+    function test_PolicyNeedsANonZeroUnitCap() public {
         vm.prank(OWNER);
-        vm.expectRevert(QuoteModule.ZeroMaxUnits.selector);
-        quote.setMarketConfig(
-            id,
-            QuoteModule.MarketConfig({
-                enabled: true,
-                rateBps: RATE_BPS,
-                volSpreadBps: 0,
-                skewBps: 0,
-                minTenor: 1 days,
-                maxTenor: 90 days,
-                maxUnits: 0
-            })
+        vm.expectRevert(QuoteModule.ZeroUnitCap.selector);
+        quote.setBasePolicy(
+            QuoteModule.BasePolicy({rateBps: RATE_BPS, skewBps: 0, minTenor: 1 days, maxTenor: 90 days, maxUnitsBps: 0})
         );
     }
 
@@ -332,23 +338,13 @@ contract PlumbQuoteDynamicTest is MidnightForkBase {
     ///      this whole mechanism replaces, and a half-finished deployment must not produce one.
     function test_PolicyWithoutVaultRefusesToQuote() public {
         QuoteModule fresh = new QuoteModule(OWNER);
-        vm.prank(OWNER);
-        fresh.setMarketConfig(
-            id,
-            QuoteModule.MarketConfig({
-                enabled: true,
-                rateBps: RATE_BPS,
-                volSpreadBps: 0,
-                skewBps: 0,
-                minTenor: 1 days,
-                maxTenor: 90 days,
-                maxUnits: MARKET_CAP
-            })
-        );
+        vm.startPrank(OWNER);
+        _configurePolicy(fresh, uint16(RATE_BPS));
+        vm.stopPrank();
 
         uint8 spacing = MIDNIGHT.tickSpacing(id);
         vm.expectRevert(QuoteModule.VaultNotSet.selector);
-        fresh.maxTick(id, MATURITY, spacing);
+        fresh.maxTick(midnightMarket(), spacing);
     }
 
     /// @notice Only the owner moves the policy's own wiring.
@@ -461,18 +457,12 @@ contract PlumbQuoteDynamicTest is MidnightForkBase {
 
         vm.startPrank(OWNER);
         solo.setVault(address(stub));
-        solo.setMarketConfig(
-            id,
-            QuoteModule.MarketConfig({
-                enabled: true,
-                rateBps: 900,
-                volSpreadBps: 250,
-                skewBps: 600,
-                minTenor: 1 days,
-                maxTenor: 90 days,
-                maxUnits: MARKET_CAP
+        solo.setBasePolicy(
+            QuoteModule.BasePolicy({
+                rateBps: 900, skewBps: 600, minTenor: 1 days, maxTenor: 90 days, maxUnitsBps: 2_500
             })
         );
+        _allowFixtureCollateral(solo, 250);
         vm.stopPrank();
 
         uint256 margin = solo.blueFloorMarginBps();
@@ -481,12 +471,12 @@ contract PlumbQuoteDynamicTest is MidnightForkBase {
 
         // Right at the edge: the floor equals the ceiling, and Plumb still quotes.
         stub.setRate(maxRate - margin);
-        assertEq(solo.effectiveRateBps(id), maxRate, "at the edge the bid must survive");
+        assertEq(solo.effectiveRateBps(midnightMarket()), maxRate, "at the edge the bid must survive");
 
         // One basis point further and it steps aside rather than quoting above MAX_RATE_BPS.
         stub.setRate(maxRate - margin + 1);
         vm.expectRevert(QuoteModule.BelowBlueFloor.selector);
-        solo.effectiveRateBps(id);
+        solo.effectiveRateBps(midnightMarket());
     }
 
     /// @notice And the three adjustments together never saturate the clamp on their own.
@@ -494,8 +484,9 @@ contract PlumbQuoteDynamicTest is MidnightForkBase {
     ///      the same rate as a half-full one and the skew would stop saying anything. The shipped
     ///      set tops out at 17.5%, well inside the 30% clamp.
     function test_TheShippedAdjustmentsNeverReachTheClamp() public {
-        vm.prank(OWNER);
+        vm.startPrank(OWNER);
         _configure(900, 250, 600);
+        vm.stopPrank();
         assertLt(900 + 250 + 600, quote.MAX_RATE_BPS(), "a saturated skew is a skew that says nothing");
     }
 

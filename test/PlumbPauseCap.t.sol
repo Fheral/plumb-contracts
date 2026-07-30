@@ -38,18 +38,7 @@ contract PlumbPauseCapTest is MidnightForkBase {
 
         vm.startPrank(OWNER);
         quote.setVault(address(vault));
-        quote.setMarketConfig(
-            id,
-            QuoteModule.MarketConfig({
-                enabled: true,
-                rateBps: RATE_BPS,
-                volSpreadBps: 0,
-                skewBps: 0,
-                minTenor: 1 days,
-                maxTenor: 90 days,
-                maxUnits: 500_000e6
-            })
-        );
+        _configurePolicy(quote, uint16(RATE_BPS));
         vault.setBlueMarket(blueMarket());
         vault.setOperator(OPERATOR);
         vault.setRiskParams(6000, 200_000e6);

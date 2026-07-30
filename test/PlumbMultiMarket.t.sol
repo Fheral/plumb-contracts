@@ -66,19 +66,9 @@ contract PlumbMultiMarketTest is MidnightForkBase {
             bytes32 mid = MIDNIGHT.touchMarket(m);
             ids.push(mid);
 
-            vm.prank(OWNER);
-            quote.setMarketConfig(
-                mid,
-                QuoteModule.MarketConfig({
-                    enabled: true,
-                    rateBps: RATE_BPS,
-                    volSpreadBps: 0,
-                    skewBps: 0,
-                    minTenor: 1 days,
-                    maxTenor: 90 days,
-                    maxUnits: 500_000e6
-                })
-            );
+            vm.startPrank(OWNER);
+            _configurePolicy(quote, uint16(RATE_BPS));
+            vm.stopPrank();
 
             // Each market has its own collateral accounting: the borrower must take a position in it.
             vm.prank(BORROWER);

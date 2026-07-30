@@ -3,6 +3,8 @@ pragma solidity 0.8.34;
 
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {TickLib, MAX_TICK} from "./interfaces/midnight/TickLib.sol";
+import {Market, CollateralParams} from "./interfaces/midnight/IMidnight.sol";
+import {IdLib} from "./interfaces/midnight/IdLib.sol";
 
 /// @notice The vault state `QuoteModule` prices against.
 /// @dev Deliberately narrow: the quoting policy reads Plumb's own book and Plumb's own opportunity
@@ -11,6 +13,7 @@ import {TickLib, MAX_TICK} from "./interfaces/midnight/TickLib.sol";
 interface IQuoteContext {
     function book(bytes32 id) external view returns (uint128 units, uint128 value, uint64 lastMark, uint64 maturity);
     function blueSupplyRateBps() external view returns (uint256);
+    function totalAssets() external view returns (uint256);
 }
 
 /// @notice Plumb's quoting policy.
@@ -18,11 +21,36 @@ interface IQuoteContext {
 /// Converts a target annualized rate into a Midnight tick. This is the only place a price is
 /// decided: neither the operator nor the bot can choose a tick, they can only observe this one.
 ///
-/// The rate quoted is not the configured one. Three adjustments apply, in this order:
+/// ## Eligibility is derived, not declared
 ///
-///  1. **Collateral spread** — a flat premium per market. A lot backed by cbBTC and a lot backed by
-///     an RWA do not carry the same default risk; a single target rate would price them alike,
-///     which is wrong in both directions.
+/// Midnight mints **one market per maturity**. An allowlist keyed by market id is therefore a
+/// treadmill: every new maturity of the same collateral pair is another id to approve by hand, for
+/// a risk that is byte-for-byte identical. Worse, the treadmill is what actually gets skipped —
+/// which is how Plumb ended up quoting a market with 10 USDC of lifetime volume while its twin,
+/// same collateral and same oracles, carried 215k.
+///
+/// So eligibility is not stored per market. It is *read off the descriptor*, which Midnight makes
+/// fully self-describing: loan token, collateral set with their LLTVs and oracles, maturity, and
+/// the two permission gates. A market is quotable when every one of its collaterals is allowed,
+/// none exceeds its LLTV ceiling, neither gate is set, and the tenor is in range.
+///
+/// The owner therefore approves **collateral, not markets** — a list that moves once a quarter
+/// instead of once a maturity. New maturities of an approved pair are quotable the moment Midnight
+/// creates them, with no transaction at all.
+///
+/// This does not widen what a compromised bot key can do. The bot never selects anything: it
+/// broadcasts what `buildBid` produces, and `isRatified` re-derives this policy at take time. The
+/// gate simply moved from a stored boolean to a function of the descriptor — and the descriptor
+/// cannot be forged, since `IdLib.toId` makes the market id the hash of the struct itself.
+///
+/// ## The rate quoted is not the configured one
+///
+/// Three adjustments apply, in this order:
+///
+///  1. **Collateral spread** — the premium of the *worst* collateral in the market's basket. A lot
+///     backed by cbBTC and a lot backed by an RWA do not carry the same default risk; a single
+///     target rate would price them alike, which is wrong in both directions. A basket is only as
+///     good as the weakest thing that can be posted against it, hence the max rather than a mean.
 ///  2. **Inventory skew** — the bid steps back as the market fills up. A cap alone says
 ///     "yes, yes, yes, NO"; the skew says "yes, a little worse, distinctly worse". Self-limitation
 ///     becomes progressive, and the seller pays for the concentration instead of the depositors
@@ -45,17 +73,41 @@ contract QuoteModule is Ownable2Step {
     uint256 public constant MAX_ADJUSTMENT_BPS = 2000;
     uint256 internal constant WAD = 1e18;
 
-    struct MarketConfig {
-        bool enabled;
-        uint16 rateBps; // base target annualized rate for this market
-        uint16 volSpreadBps; // collateral risk premium, added flat
-        uint16 skewBps; // added in full when the market is at `maxUnits`, pro rata below
-        uint32 minTenor; // below this, the gain covers neither gas nor settlement risk
-        uint32 maxTenor; // above this, we refuse to carry the duration
-        uint128 maxUnits; // cap on units held on this market
+    /// @notice What Plumb accepts to take as collateral, and at what premium.
+    /// @dev Keyed by token, not by market: this is the unit at which collateral risk actually
+    ///      exists. `maxLltv` is the ceiling on how much a borrower may draw against it — a higher
+    ///      LLTV is a thinner equity buffer, hence a market Plumb may want to refuse even on
+    ///      collateral it otherwise accepts.
+    struct CollateralPolicy {
+        bool allowed;
+        uint16 volSpreadBps; // risk premium for this collateral, added flat
+        uint64 maxLltv; // WAD. Above this, the market is refused whatever the premium
     }
 
-    mapping(bytes32 id => MarketConfig) internal _config;
+    /// @notice The part of the policy that does not depend on the market.
+    /// @dev `maxUnitsBps` is a fraction of NAV rather than an absolute: it is the only way a
+    ///      per-market cap can exist without a per-market number to maintain, and it keeps the skew
+    ///      meaningful as the vault grows. An absolute cap sized for a vault in regime makes the
+    ///      skew inert on a small vault — at 25,000 USDC of cap on a 214 USDC vault, the skew
+    ///      saturates at 1.2 bps and the mechanism may as well not exist.
+    struct BasePolicy {
+        uint16 rateBps; // base target annualized rate
+        uint16 skewBps; // added in full when a market is at its unit cap, pro rata below
+        uint32 minTenor; // below this, the gain covers neither gas nor settlement risk
+        uint32 maxTenor; // above this, we refuse to carry the duration
+        uint16 maxUnitsBps; // per-market unit cap, in bps of NAV
+    }
+
+    BasePolicy internal _base;
+
+    mapping(address token => CollateralPolicy) internal _collateral;
+
+    /// @notice Markets the owner refuses regardless of their descriptor.
+    /// @dev The escape hatch, and deliberately the only per-market switch left. Eligibility is
+    ///      derived, so there has to be a way to say "not this one" about a market that passes
+    ///      every structural check and is still known to be bad. It can only ever *remove*, never
+    ///      add: blocking is safe in a way that enabling is not.
+    mapping(bytes32 id => bool) public blocked;
 
     /// @notice The vault whose book and opportunity cost this policy prices against.
     IQuoteContext public vault;
@@ -97,41 +149,74 @@ contract QuoteModule is Ownable2Step {
     ///      owner write a number that reads like a policy and is not one.
     uint256 public constant MAX_CONTINUOUS_FEE_CAP = 317_097_919;
 
-    event SetMarketConfig(bytes32 indexed id, MarketConfig config);
+    event SetBasePolicy(BasePolicy policy);
+    event SetCollateralPolicy(address indexed token, CollateralPolicy policy);
+    event SetBlocked(bytes32 indexed id, bool blocked);
     event SetVault(address indexed vault);
     event SetBlueFloorMargin(uint256 marginBps);
     event SetContinuousFeeCap(uint256 cap);
 
-    error MarketDisabled();
     error RateOutOfBounds();
     error TenorOutOfBounds();
     error InvalidTenorRange();
     error InvalidSpacing();
     error NoAcceptableTick();
     error AdjustmentOutOfBounds();
-    error ZeroMaxUnits();
+    error ZeroUnitCap();
     error VaultNotSet();
     error BelowBlueFloor();
     error ZeroAddress();
     error FeeCapOutOfBounds();
+    error MarketBlocked();
+    error MarketPermissioned();
+    error NoCollateral();
+    error CollateralNotAllowed();
+    error LltvTooHigh();
 
     constructor(address owner_) Ownable(owner_) {}
 
-    function config(bytes32 id) external view returns (MarketConfig memory) {
-        return _config[id];
+    // -------------------------------------------------------------------------
+    // Policy
+    // -------------------------------------------------------------------------
+
+    function basePolicy() external view returns (BasePolicy memory) {
+        return _base;
     }
 
-    function setMarketConfig(bytes32 id, MarketConfig calldata c) external onlyOwner {
-        if (c.enabled) {
-            require(c.rateBps >= MIN_RATE_BPS && c.rateBps <= MAX_RATE_BPS, RateOutOfBounds());
-            require(c.volSpreadBps <= MAX_ADJUSTMENT_BPS && c.skewBps <= MAX_ADJUSTMENT_BPS, AdjustmentOutOfBounds());
-            require(c.minTenor > 0 && c.minTenor < c.maxTenor, InvalidTenorRange());
-            require(c.maxTenor <= MAX_TENOR, TenorOutOfBounds());
-            // The skew divides by `maxUnits`: a market enabled with a zero cap could not be priced.
-            require(c.maxUnits > 0, ZeroMaxUnits());
+    function collateralPolicy(address token) external view returns (CollateralPolicy memory) {
+        return _collateral[token];
+    }
+
+    function setBasePolicy(BasePolicy calldata p) external onlyOwner {
+        require(p.rateBps >= MIN_RATE_BPS && p.rateBps <= MAX_RATE_BPS, RateOutOfBounds());
+        require(p.skewBps <= MAX_ADJUSTMENT_BPS, AdjustmentOutOfBounds());
+        require(p.minTenor > 0 && p.minTenor < p.maxTenor, InvalidTenorRange());
+        require(p.maxTenor <= MAX_TENOR, TenorOutOfBounds());
+        // The skew divides by the unit cap: a zero cap could not be priced, and would also mean a
+        // policy that accepts markets it can never fill.
+        require(p.maxUnitsBps > 0 && p.maxUnitsBps <= 10_000, ZeroUnitCap());
+        _base = p;
+        emit SetBasePolicy(p);
+    }
+
+    /// @notice Approves — or withdraws approval from — a collateral token.
+    /// @dev This is the whole of the market-selection surface. Approving a token makes every
+    ///      present and future Midnight market built on it quotable, at any maturity, with no
+    ///      further transaction.
+    function setCollateralPolicy(address token, CollateralPolicy calldata p) external onlyOwner {
+        require(token != address(0), ZeroAddress());
+        if (p.allowed) {
+            require(p.volSpreadBps <= MAX_ADJUSTMENT_BPS, AdjustmentOutOfBounds());
+            require(p.maxLltv > 0 && p.maxLltv <= WAD, LltvTooHigh());
         }
-        _config[id] = c;
-        emit SetMarketConfig(id, c);
+        _collateral[token] = p;
+        emit SetCollateralPolicy(token, p);
+    }
+
+    /// @notice Refuses a specific market whatever its descriptor says.
+    function setBlocked(bytes32 id, bool value) external onlyOwner {
+        blocked[id] = value;
+        emit SetBlocked(id, value);
     }
 
     /// @notice Points the policy at its vault. Set once, right after deployment.
@@ -159,21 +244,87 @@ contract QuoteModule is Ownable2Step {
         emit SetContinuousFeeCap(cap);
     }
 
+    // -------------------------------------------------------------------------
+    // Eligibility
+    // -------------------------------------------------------------------------
+
+    /// @notice Reverts unless this market is one Plumb accepts to price at all.
+    /// @dev Every check reads the descriptor, and the descriptor cannot lie: the caller's `id` is
+    ///      `IdLib.toId(market)`, so a market struct and its id are the same fact stated twice.
+    ///
+    ///      Gates are refused outright rather than priced. A permissioned market is one where a
+    ///      third party can decide whether Plumb may enter, or whether anyone may liquidate the
+    ///      borrower who backs Plumb's lot — neither is a risk a spread can express, because both
+    ///      are exercised *after* the position is taken and there is no price at which being
+    ///      unable to exit is acceptable.
+    function requireEligible(Market memory market) public view {
+        bytes32 id = IdLib.toId(market);
+        require(!blocked[id], MarketBlocked());
+        require(market.enterGate == address(0) && market.liquidatorGate == address(0), MarketPermissioned());
+
+        uint256 n = market.collateralParams.length;
+        require(n > 0, NoCollateral());
+        for (uint256 i = 0; i < n; ++i) {
+            CollateralPolicy memory cp = _collateral[market.collateralParams[i].token];
+            require(cp.allowed, CollateralNotAllowed());
+            require(market.collateralParams[i].lltv <= cp.maxLltv, LltvTooHigh());
+        }
+    }
+
+    /// @notice The collateral premium this market carries: the worst of its basket.
+    /// @dev Assumes `requireEligible` has passed, i.e. every collateral is allowed.
+    function volSpreadBps(Market memory market) public view returns (uint256 worst) {
+        uint256 n = market.collateralParams.length;
+        for (uint256 i = 0; i < n; ++i) {
+            uint256 s = _collateral[market.collateralParams[i].token].volSpreadBps;
+            if (s > worst) worst = s;
+        }
+    }
+
+    /// @notice Cap on the units Plumb holds on any single market, given a NAV.
+    ///
+    /// @dev Takes the NAV as an argument rather than reading it, because the two callers disagree
+    ///      on what the NAV *is* and both are right. Outside a fill, it is `totalAssets()`. Inside
+    ///      `onBuy` the buyer's assets are still in the vault — Midnight collects them when the
+    ///      callback returns — so the caller must net them out first, exactly as it already does
+    ///      for the book cap. Reading `totalAssets()` here would silently use the inflated one.
+    ///
+    ///      Units are compared against a cap derived from assets. At a price below par a unit costs
+    ///      less than an asset, so this is marginally permissive in unit terms; the binding
+    ///      constraint on capital is the vault's own book cap, in assets, which is not.
+    function marketUnitCap(uint256 nav) public view returns (uint256) {
+        return (nav * _base.maxUnitsBps) / 10_000;
+    }
+
+    // -------------------------------------------------------------------------
+    // Pricing
+    // -------------------------------------------------------------------------
+
     /// @notice The annualized rate Plumb actually demands on this market at this instant, in bps.
     /// @dev Exposed on its own because it is the number a human reads to understand a quote — the
     ///      tick only says what it costs, not why.
-    function effectiveRateBps(bytes32 id) public view returns (uint256) {
-        MarketConfig memory c = _config[id];
-        require(c.enabled, MarketDisabled());
+    function effectiveRateBps(Market memory market) public view returns (uint256) {
         require(address(vault) != address(0), VaultNotSet());
+        requireEligible(market);
 
-        (uint128 held,,,) = vault.book(id);
-        // Held units above the cap are possible after the owner lowers it: the skew saturates
-        // rather than overshooting, and the cap in `onBuy` refuses the fill anyway.
-        uint256 heldForSkew = held > c.maxUnits ? c.maxUnits : held;
-        uint256 skew = (uint256(c.skewBps) * heldForSkew) / c.maxUnits;
+        uint256 cap = marketUnitCap(vault.totalAssets());
+        (uint128 held,,,) = vault.book(IdLib.toId(market));
+        uint256 skew;
+        if (cap > 0) {
+            // Held units above the cap are possible without anyone acting, since the cap follows
+            // the NAV: a drawdown shrinks it under a book that has not moved. The skew saturates
+            // rather than overshooting, and the cap in `onBuy` refuses the fill anyway.
+            uint256 heldForSkew = held > cap ? cap : held;
+            skew = (uint256(_base.skewBps) * heldForSkew) / cap;
+        } else if (held > 0) {
+            // A cap of zero means a NAV of zero, and units held against it. That is the saturated
+            // case taken to its limit, not a division to perform.
+            skew = _base.skewBps;
+        }
+        // Nothing held and no NAV: the skew prices inventory, and there is none. Leaving it at zero
+        // matters — an empty vault must quote its base rate, not the top of its band.
 
-        uint256 rate = uint256(c.rateBps) + c.volSpreadBps + skew;
+        uint256 rate = uint256(_base.rateBps) + volSpreadBps(market) + skew;
         if (rate > MAX_RATE_BPS) rate = MAX_RATE_BPS;
 
         uint256 floorRate = vault.blueSupplyRateBps() + blueFloorMarginBps;
@@ -191,15 +342,13 @@ contract QuoteModule is Ownable2Step {
     /// @dev The target price is the linear discounting of par at the effective rate. Tick rounding
     ///      is always downward: Plumb will never pay more than its target price, even if that means
     ///      quoting a notch too low and missing the trade.
-    function maxTick(bytes32 id, uint256 maturity, uint8 spacing) public view returns (uint256) {
-        MarketConfig memory c = _config[id];
-        require(c.enabled, MarketDisabled());
+    function maxTick(Market memory market, uint8 spacing) public view returns (uint256) {
         require(spacing > 0 && MAX_TICK % spacing == 0, InvalidSpacing());
 
-        uint256 remaining = maturity > block.timestamp ? maturity - block.timestamp : 0;
-        require(remaining >= c.minTenor && remaining <= c.maxTenor, TenorOutOfBounds());
+        uint256 remaining = market.maturity > block.timestamp ? market.maturity - block.timestamp : 0;
+        require(remaining >= _base.minTenor && remaining <= _base.maxTenor, TenorOutOfBounds());
 
-        uint256 discount = (effectiveRateBps(id) * WAD * remaining) / (10_000 * 365 days);
+        uint256 discount = (effectiveRateBps(market) * WAD * remaining) / (10_000 * 365 days);
         uint256 targetPrice = WAD - discount; // discount < WAD as long as rate <= 3000 and remaining <= 90d
 
         uint256 tick = TickLib.priceToTick(targetPrice, spacing);
@@ -212,7 +361,7 @@ contract QuoteModule is Ownable2Step {
     }
 
     /// @notice Unit price (WAD) actually paid at the quoted tick. Useful to offchain monitoring.
-    function maxPrice(bytes32 id, uint256 maturity, uint8 spacing) external view returns (uint256) {
-        return TickLib.tickToPrice(maxTick(id, maturity, spacing));
+    function maxPrice(Market memory market, uint8 spacing) external view returns (uint256) {
+        return TickLib.tickToPrice(maxTick(market, spacing));
     }
 }

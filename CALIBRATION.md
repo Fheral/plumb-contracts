@@ -37,6 +37,12 @@ Four questions, answered in order. Each one bounds the next.
 4. **What does Plumb's own position change?** A book that is filling up is a
    book concentrating risk. That fixes the skew.
 
+None of these is set per market. Eligibility and pricing are read off the
+market descriptor — its collateral set, their LLTVs, its gates — so approving a
+collateral token prices every Midnight market built on it, at every maturity,
+present and future. Midnight mints one market per maturity; a per-market table
+would be a treadmill, and the rung that gets skipped is the one that matters.
+
 A fifth question — what the *competition* charges — has no answer yet. Nobody
 else holds a standing bid on Midnight. The day someone does, the base rate
 becomes an observable and this method's step 2 gets replaced.
@@ -45,9 +51,10 @@ becomes an observable and this method's step 2 gets replaced.
 
 | Parameter | Value | Where |
 |---|---|---|
-| `rateBps` | 900 (9%) | per market, `setMarketConfig` |
-| `volSpreadBps` | 150 / 250 | per market, by collateral (below) |
-| `skewBps` | 600 (6%) | per market, `setMarketConfig` |
+| `rateBps` | 900 (9%) | global, `setBasePolicy` |
+| `volSpreadBps` | 150 / 250 | per collateral token, `setCollateralPolicy` (below) |
+| `skewBps` | 600 (6%) | global, `setBasePolicy` |
+| `maxUnitsBps` | 2500 (25% of NAV) | global, `setBasePolicy` |
 | `blueFloorMarginBps` | 200 (2%) | global, `setBlueFloorMargin` |
 | `continuousFeeCap` | 0 | global, `setContinuousFeeCap` |
 

@@ -311,24 +311,17 @@ contract PlumbInvariantTest is MidnightForkBase {
         deal(WETH, BORROWER, 20_000e18);
         vm.prank(OWNER);
         quote.setVault(address(vault));
+        // One policy covers all of them: these markets differ only by `rcfThreshold`, so they share
+        // a collateral basket and therefore a price. That is the point of deriving eligibility.
+        vm.startPrank(OWNER);
+        _configurePolicy(quote, uint16(900));
+        vm.stopPrank();
+
         for (uint256 k; k < N_MARKETS; ++k) {
             Market memory m = midnightMarket();
             m.rcfThreshold = 3e9 + k;
             bytes32 mid = MIDNIGHT.touchMarket(m);
 
-            vm.prank(OWNER);
-            quote.setMarketConfig(
-                mid,
-                QuoteModule.MarketConfig({
-                    enabled: true,
-                    rateBps: 900,
-                    volSpreadBps: 0,
-                    skewBps: 0,
-                    minTenor: 1 days,
-                    maxTenor: 90 days,
-                    maxUnits: 500_000e6
-                })
-            );
             vm.prank(BORROWER);
             MIDNIGHT.supplyCollateral(m, 0, 1_000e18, BORROWER);
         }

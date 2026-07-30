@@ -64,20 +64,21 @@ contract DeployLocal is Script {
         bytes32 id = MIDNIGHT.touchMarket(_midnightMarket());
 
         quote.setVault(address(vault));
-        quote.setMarketConfig(
-            id,
-            QuoteModule.MarketConfig({
-                enabled: true,
-                // The three pricing parameters are the ones `DeployMainnet` ships, and for the
-                // same reasons (`CALIBRATION.md`). A local book that priced differently from
-                // production would be a rehearsal of something else.
-                rateBps: 900,
-                volSpreadBps: 250,
-                skewBps: 600,
-                minTenor: 1 days,
-                maxTenor: 90 days,
-                maxUnits: 500_000e6
+        // The pricing parameters are the ones `DeployMainnet` ships, and for the same reasons
+        // (`CALIBRATION.md`). A local book that priced differently from production would be a
+        // rehearsal of something else.
+        quote.setBasePolicy(
+            QuoteModule.BasePolicy({
+                rateBps: 900, skewBps: 600, minTenor: 1 days, maxTenor: 90 days, maxUnitsBps: 5_000
             })
+        );
+        // Approving the collateral is what makes the market quotable — and with it every other
+        // maturity Midnight mints on the same pair.
+        quote.setCollateralPolicy(
+            WETH, QuoteModule.CollateralPolicy({allowed: true, volSpreadBps: 250, maxLltv: 0.86e18})
+        );
+        quote.setCollateralPolicy(
+            COLL2, QuoteModule.CollateralPolicy({allowed: true, volSpreadBps: 250, maxLltv: 0.98e18})
         );
 
         vault.setBlueMarket(

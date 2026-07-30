@@ -56,21 +56,30 @@ contract DeployMainnet is Script {
     /// @dev Base target rate. The book prints 3.6–3.7%; Plumb bids well wider, and that gap is the
     ///      depositors' yield.
     uint16 constant RATE_BPS = 900;
-    /// @dev Collateral premium. This market accepts `WETH-USDC-collat` at 98% LLTV alongside WETH
-    ///      at 86%, and a market carries the risk of the worst collateral it allows — hence the
-    ///      higher of the two spreads, not the lower.
+    /// @dev Collateral premium, carried by the token rather than the market. `QuoteModule` takes
+    ///      the worst spread of a market's basket, so these two are what the WETH markets quote:
+    ///      `WETH-USDC-collat` at 98% LLTV alongside WETH at 86% resolves to 250 either way.
     uint16 constant VOL_SPREAD_BPS = 250;
-    /// @dev Inventory skew, applied pro rata up to `MAX_UNITS`. 900 + 250 + 600 = 1750, comfortably
-    ///      under `MAX_RATE_BPS`: the clamp must never bite before the book is full, or a full book
-    ///      and a three-quarters-full one would quote the same price.
+    /// @dev LLTV ceilings, per collateral. A market that lets a borrower draw more than this
+    ///      against the token is refused outright — a thinner equity buffer than we underwrote is
+    ///      not something a spread can fix after the fact.
+    uint64 constant MAX_LLTV_WETH = 0.86e18;
+    uint64 constant MAX_LLTV_COLL2 = 0.98e18;
+    /// @dev Inventory skew, applied pro rata up to the per-market unit cap. 900 + 250 + 600 = 1750,
+    ///      comfortably under `MAX_RATE_BPS`: the clamp must never bite before the book is full, or
+    ///      a full book and a three-quarters-full one would quote the same price.
     uint16 constant SKEW_BPS = 600;
     uint32 constant MIN_TENOR = 1 days;
     uint32 constant MAX_TENOR = 90 days;
 
     // --- risk, Phase 4 opening settings --------------------------------------
 
-    /// @dev Per-market unit cap. Sized to the capped launch, not to the vault's ambitions.
-    uint128 constant MAX_UNITS = 25_000e6;
+    /// @dev Per-market unit cap, as a fraction of NAV. Equal to the book cap: one market may be the
+    ///      whole book, which is the same relationship the absolute cap encoded before (25,000 of a
+    ///      100,000 deposit cap). Expressed as a ratio, it now holds at every vault size instead of
+    ///      only at the cap — and it keeps the skew alive on a small vault, where an absolute cap
+    ///      sized for the launch ceiling made it saturate at barely a basis point.
+    uint16 constant MAX_UNITS_BPS = 2_500;
     /// @dev Book capped at 25% of NAV. Three quarters of the capital stays on Blue, withdrawable on
     ///      demand — the opposite of the local script's 50%, and the point of a capped run.
     uint256 constant MAX_BOOK_BPS = 2_500;
@@ -79,8 +88,9 @@ contract DeployMainnet is Script {
     uint128 constant MAX_SINGLE_FILL = 10_000e6;
     /// @dev Absolute ceiling on the vault's NAV for the Phase 4 run — the only cap that is not a
     ///      ratio, and therefore the only one that bounds what a bug can reach. 100k USDC is four
-    ///      times `MAX_UNITS` and ten times `MAX_SINGLE_FILL`: large enough that the book cap, the
-    ///      per-market cap and the fill cap are all reachable and get exercised for real, small
+    ///      times the per-market cap at that NAV and ten times `MAX_SINGLE_FILL`: large enough that
+    ///      the book cap, the per-market cap and the fill cap are all reachable and get exercised
+    ///      for real, small
     ///      enough to be a sum this desk is willing to lose entirely. Raised by the multisig once
     ///      the external audit is in — that is the sequencing `PLAN.md` states, and until now
     ///      nothing enforced it.
@@ -187,17 +197,14 @@ contract DeployMainnet is Script {
         console2.log("below is its own, in this order. Build each with script/Admin.s.sol.");
         console2.log("");
         console2.log(" 1. quote.setVault(vault)                  -- until this, maxTick reverts");
-        console2.log(
-            " 2. quote.setMarketConfig(id, ...)         -- rate %s, spread %s, skew %s",
-            RATE_BPS,
-            VOL_SPREAD_BPS,
-            SKEW_BPS
-        );
-        console2.log(" 3. vault.setBlueMarket(...)               -- where the idle sleeve earns");
-        console2.log(" 4. vault.setRiskParams(%s, %s)", MAX_BOOK_BPS, MAX_SINGLE_FILL);
+        console2.log(" 2. quote.setBasePolicy(...)               -- rate %s, skew %s", RATE_BPS, SKEW_BPS);
+        console2.log(" 3. quote.setCollateralPolicy(WETH, ...)   -- and COLL2. THIS is what selects markets:", "");
+        console2.log("    approving a collateral makes every maturity on it quotable, forever.");
+        console2.log(" 4. vault.setBlueMarket(...)               -- where the idle sleeve earns");
+        console2.log(" 5. vault.setRiskParams(%s, %s)", MAX_BOOK_BPS, MAX_SINGLE_FILL);
         console2.log("    (the deposit cap is already %s -- set in the constructor)", DEPOSIT_CAP);
-        console2.log(" 5. vault.setOperator(operator)            -- the bot may quote from here on");
-        console2.log(" 6. vault.openEpoch(budget)                -- LAST, and only when ready:");
+        console2.log(" 6. vault.setOperator(operator)            -- the bot may quote from here on");
+        console2.log(" 7. vault.openEpoch(budget)                -- LAST, and only when ready:");
         console2.log("    this is what starts the quoting. Nothing above it moves any capital.");
     }
 
@@ -229,18 +236,29 @@ contract DeployMainnet is Script {
         return false;
     }
 
-    /// @notice The market's parameters, and the policy for it. Exposed so the deployment and the
+    /// @notice The market-independent half of the policy. Exposed so the deployment and the
     ///         proposals that follow it read the same numbers from the same place.
-    function marketConfig() public pure returns (QuoteModule.MarketConfig memory) {
-        return QuoteModule.MarketConfig({
-            enabled: true,
-            rateBps: RATE_BPS,
-            volSpreadBps: VOL_SPREAD_BPS,
-            skewBps: SKEW_BPS,
-            minTenor: MIN_TENOR,
-            maxTenor: MAX_TENOR,
-            maxUnits: MAX_UNITS
+    function basePolicy() public pure returns (QuoteModule.BasePolicy memory) {
+        return QuoteModule.BasePolicy({
+            rateBps: RATE_BPS, skewBps: SKEW_BPS, minTenor: MIN_TENOR, maxTenor: MAX_TENOR, maxUnitsBps: MAX_UNITS_BPS
         });
+    }
+
+    /// @notice The collateral Plumb underwrites, and at what premium. Approving these two is what
+    ///         makes the WETH markets quotable — every maturity of them, present and future.
+    function collateralPolicies()
+        public
+        pure
+        returns (address[] memory tokens, QuoteModule.CollateralPolicy[] memory policies)
+    {
+        tokens = new address[](2);
+        policies = new QuoteModule.CollateralPolicy[](2);
+        tokens[0] = WETH;
+        policies[0] =
+            QuoteModule.CollateralPolicy({allowed: true, volSpreadBps: VOL_SPREAD_BPS, maxLltv: MAX_LLTV_WETH});
+        tokens[1] = COLL2;
+        policies[1] =
+            QuoteModule.CollateralPolicy({allowed: true, volSpreadBps: VOL_SPREAD_BPS, maxLltv: MAX_LLTV_COLL2});
     }
 
     function blueMarket() public pure returns (BlueMarketParams memory) {

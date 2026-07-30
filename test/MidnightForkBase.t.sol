@@ -6,6 +6,7 @@ import {IMidnight, Market, CollateralParams, Offer} from "../src/interfaces/midn
 import {IdLib} from "../src/interfaces/midnight/IdLib.sol";
 import {BlueMarketParams, IMorphoBlue} from "../src/interfaces/IMorphoBlue.sol";
 import {TickLib as TickLibView} from "../src/interfaces/midnight/TickLib.sol";
+import {QuoteModule} from "../src/QuoteModule.sol";
 
 interface IERC20Like {
     function approve(address, uint256) external returns (bool);
@@ -73,6 +74,30 @@ abstract contract MidnightForkBase is Test {
         MIDNIGHT.setIsAuthorized(address(ratifier), true, BORROWER);
         vm.prank(BORROWER);
         MIDNIGHT.supplyCollateral(midnightMarket(), 0, 3000e18, BORROWER);
+    }
+
+    /// @dev Approves the fixture market's two collaterals at their exact LLTVs. Since eligibility
+    ///      is derived from the descriptor, this — not a market id — is what makes the fixture
+    ///      quotable, and it makes every other maturity on the same pair quotable with it.
+    function _allowFixtureCollateral(QuoteModule quote, uint16 spreadBps) internal {
+        quote.setCollateralPolicy(
+            WETH, QuoteModule.CollateralPolicy({allowed: true, volSpreadBps: spreadBps, maxLltv: 0.86e18})
+        );
+        quote.setCollateralPolicy(
+            COLL2, QuoteModule.CollateralPolicy({allowed: true, volSpreadBps: spreadBps, maxLltv: 0.98e18})
+        );
+    }
+
+    /// @dev The policy most tests want: one rate, no premium, no skew, and a per-market cap that
+    ///      cannot bind before the vault's own book cap does. Expressed as a fraction of NAV, so it
+    ///      means the same thing on the WETH fixture as on the USDC one.
+    function _configurePolicy(QuoteModule quote, uint16 rateBps) internal {
+        quote.setBasePolicy(
+            QuoteModule.BasePolicy({
+                rateBps: rateBps, skewBps: 0, minTenor: 1 days, maxTenor: 90 days, maxUnitsBps: 10_000
+            })
+        );
+        _allowFixtureCollateral(quote, 0);
     }
 
     function midnightMarket() internal pure returns (Market memory m) {

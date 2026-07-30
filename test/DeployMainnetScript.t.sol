@@ -77,7 +77,7 @@ contract DeployMainnetScriptTest is MidnightForkBase {
 
     /// @notice The shipped policy is one the module accepts, and it prices the real market.
     ///
-    /// @dev A set of constants that `setMarketConfig` would reject, or that `maxTick` could not
+    /// @dev A set of constants that `setBasePolicy` would reject, or that `maxTick` could not
     ///      turn into a tick, would only be discovered on the day of the deployment. Applying them
     ///      to the real Midnight market on a fork is the cheap way to know beforehand.
     function test_TheShippedPolicyPricesTheRealMarket() public {
@@ -95,16 +95,24 @@ contract DeployMainnetScriptTest is MidnightForkBase {
         );
         quote.setVault(address(vault));
         vault.setBlueMarket(script.blueMarket());
-        quote.setMarketConfig(id, script.marketConfig());
+        quote.setBasePolicy(script.basePolicy());
+        (address[] memory tokens, QuoteModule.CollateralPolicy[] memory policies) = script.collateralPolicies();
+        for (uint256 i = 0; i < tokens.length; ++i) {
+            quote.setCollateralPolicy(tokens[i], policies[i]);
+        }
 
-        uint256 rate = quote.effectiveRateBps(id);
-        uint256 tick = quote.maxTick(id, MATURITY, MIDNIGHT.tickSpacing(id));
+        uint256 rate = quote.effectiveRateBps(midnightMarket());
+        uint256 tick = quote.maxTick(midnightMarket(), MIDNIGHT.tickSpacing(id));
         console2.log("empty-book rate (bps)", rate);
         console2.log("blue supply rate (bps)", vault.blueSupplyRateBps());
         console2.log("tick", tick);
 
-        QuoteModule.MarketConfig memory c = script.marketConfig();
-        assertEq(rate, uint256(c.rateBps) + c.volSpreadBps, "an empty book quotes base + spread, nothing else");
+        QuoteModule.BasePolicy memory p = script.basePolicy();
+        assertEq(
+            rate,
+            uint256(p.rateBps) + quote.volSpreadBps(midnightMarket()),
+            "an empty book quotes base + spread, nothing else"
+        );
         assertGt(rate, vault.blueSupplyRateBps() + quote.blueFloorMarginBps(), "the bid must clear the Blue floor");
         assertGt(tick, 0, "the policy must produce a usable tick on the real market");
     }
@@ -118,8 +126,13 @@ contract DeployMainnetScriptTest is MidnightForkBase {
     /// @dev If `rateBps + volSpreadBps + skewBps` reached `MAX_RATE_BPS`, the last quarter of the
     ///      book would be priced like the third, and the skew would stop being a signal.
     function test_AFullBookStillQuotesUnderTheClamp() public view {
-        QuoteModule.MarketConfig memory c = script.marketConfig();
-        uint256 full = uint256(c.rateBps) + c.volSpreadBps + c.skewBps;
+        QuoteModule.BasePolicy memory p = script.basePolicy();
+        (, QuoteModule.CollateralPolicy[] memory policies) = script.collateralPolicies();
+        uint256 worst;
+        for (uint256 i = 0; i < policies.length; ++i) {
+            if (policies[i].volSpreadBps > worst) worst = policies[i].volSpreadBps;
+        }
+        uint256 full = uint256(p.rateBps) + worst + p.skewBps;
         console2.log("full-book rate (bps)", full);
         assertLt(full, 3000, "a saturated skew is a skew that says nothing");
     }

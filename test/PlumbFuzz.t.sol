@@ -61,18 +61,7 @@ contract PlumbFuzzTest is MidnightForkBase {
     }
 
     function _configure(uint256 rateBps) internal {
-        quote.setMarketConfig(
-            id,
-            QuoteModule.MarketConfig({
-                enabled: true,
-                rateBps: uint16(rateBps),
-                volSpreadBps: 0,
-                skewBps: 0,
-                minTenor: 1 days,
-                maxTenor: 90 days,
-                maxUnits: 400_000e6
-            })
-        );
+        _configurePolicy(quote, uint16(uint16(rateBps)));
     }
 
     // ---------------------------------------------------------------------
@@ -87,8 +76,9 @@ contract PlumbFuzzTest is MidnightForkBase {
         rateBps = uint16(bound(rateBps, quote.MIN_RATE_BPS(), quote.MAX_RATE_BPS()));
         // We advance time to sweep every admissible residual maturity.
         elapsed = bound(elapsed, 0, tenorAtFork - 1 days);
-        vm.prank(OWNER);
+        vm.startPrank(OWNER);
         _configure(rateBps);
+        vm.stopPrank();
         vm.warp(block.timestamp + elapsed);
 
         uint8 spacing = MIDNIGHT.tickSpacing(id);
@@ -96,11 +86,11 @@ contract PlumbFuzzTest is MidnightForkBase {
         // The target is discounted at the *effective* rate, not the configured one: the Blue floor
         // may legitimately have raised it. What must never happen is the effective rate coming out
         // below the configured one — that would be the vault paying more than its own policy.
-        uint256 effective = quote.effectiveRateBps(id);
+        uint256 effective = quote.effectiveRateBps(midnightMarket());
         assertGe(effective, rateBps, "an adjustment can only raise the demanded rate");
         uint256 target = 1e18 - (effective * 1e18 * remaining) / (10_000 * 365 days);
 
-        uint256 tick = quote.maxTick(id, MATURITY, spacing);
+        uint256 tick = quote.maxTick(midnightMarket(), spacing);
         assertLe(TickLib.tickToPrice(tick), target, "Plumb must never quote above its target");
         assertGt(TickLib.tickToPrice(tick + spacing), target, "the next notch must exceed: the quote is tight");
     }
@@ -111,7 +101,11 @@ contract PlumbFuzzTest is MidnightForkBase {
         vm.assume(rateBps < quote.MIN_RATE_BPS() || rateBps > quote.MAX_RATE_BPS());
         vm.prank(OWNER);
         vm.expectRevert(QuoteModule.RateOutOfBounds.selector);
-        _configure(rateBps);
+        quote.setBasePolicy(
+            QuoteModule.BasePolicy({
+                rateBps: rateBps, skewBps: 0, minTenor: 1 days, maxTenor: 90 days, maxUnitsBps: 10_000
+            })
+        );
     }
 
     // ---------------------------------------------------------------------

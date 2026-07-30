@@ -166,33 +166,56 @@ contract Admin is Script {
     // QuoteModule — onlyOwner
     // -------------------------------------------------------------------------
 
-    /// @notice Enables or retunes a market's pricing.
-    /// @dev Seven fields and a market id. `enabled: false` is how a market is taken off the book:
-    ///      the policy stops pricing it, so no offer on it can be ratified.
-    function setMarketConfig() external {
-        bytes32 id = vm.envBytes32("MARKET_ID");
-        QuoteModule.MarketConfig memory c = QuoteModule.MarketConfig({
-            enabled: vm.envBool("ENABLED"),
+    /// @notice Retunes the part of the pricing that does not depend on the market.
+    /// @dev Applies to every market at once — that is the point. There is no per-market rate to
+    ///      set any more, so this is proposed once and forgotten.
+    function setBasePolicy() external {
+        QuoteModule.BasePolicy memory p = QuoteModule.BasePolicy({
             rateBps: uint16(vm.envUint("RATE_BPS")),
-            volSpreadBps: uint16(vm.envUint("VOL_SPREAD_BPS")),
             skewBps: uint16(vm.envUint("SKEW_BPS")),
             minTenor: uint32(vm.envUint("MIN_TENOR")),
             maxTenor: uint32(vm.envUint("MAX_TENOR")),
-            maxUnits: uint128(vm.envUint("MAX_UNITS"))
+            maxUnitsBps: uint16(vm.envUint("MAX_UNITS_BPS"))
         });
-        console2.log("marketId     :", vm.toString(id));
-        console2.log("enabled      :", c.enabled);
-        console2.log("rateBps      :", c.rateBps);
-        console2.log("volSpreadBps :", c.volSpreadBps);
-        console2.log("skewBps      :", c.skewBps);
-        console2.log("minTenor     :", c.minTenor);
-        console2.log("maxTenor     :", c.maxTenor);
-        console2.log("maxUnits     :", c.maxUnits);
+        console2.log("rateBps      :", p.rateBps);
+        console2.log("skewBps      :", p.skewBps);
+        console2.log("minTenor     :", p.minTenor);
+        console2.log("maxTenor     :", p.maxTenor);
+        console2.log("maxUnitsBps  :", p.maxUnitsBps);
+        _propose(_quote(), abi.encodeCall(QuoteModule.setBasePolicy, (p)), "quote.setBasePolicy(BasePolicy)");
+    }
+
+    /// @notice Approves a collateral token, or withdraws that approval.
+    /// @dev This is the whole of market selection. Approving a token makes every Midnight market
+    ///      built on it quotable, at any maturity, present or future — no per-market transaction
+    ///      exists any more. `allowed: false` withdraws that, and stops pricing every market whose
+    ///      basket contains the token.
+    function setCollateralPolicy() external {
+        address token = vm.envAddress("COLLATERAL_TOKEN");
+        QuoteModule.CollateralPolicy memory p = QuoteModule.CollateralPolicy({
+            allowed: vm.envBool("ALLOWED"),
+            volSpreadBps: uint16(vm.envUint("VOL_SPREAD_BPS")),
+            maxLltv: uint64(vm.envUint("MAX_LLTV"))
+        });
+        console2.log("token        :", token);
+        console2.log("allowed      :", p.allowed);
+        console2.log("volSpreadBps :", p.volSpreadBps);
+        console2.log("maxLltv      :", p.maxLltv);
         _propose(
             _quote(),
-            abi.encodeCall(QuoteModule.setMarketConfig, (id, c)),
-            "quote.setMarketConfig(bytes32,MarketConfig)"
+            abi.encodeCall(QuoteModule.setCollateralPolicy, (token, p)),
+            "quote.setCollateralPolicy(address,CollateralPolicy)"
         );
+    }
+
+    /// @notice Refuses one specific market, whatever its descriptor says.
+    /// @dev The escape hatch, and the only per-market switch left. It can only remove.
+    function setBlocked() external {
+        bytes32 id = vm.envBytes32("MARKET_ID");
+        bool value = vm.envBool("BLOCKED");
+        console2.log("marketId     :", vm.toString(id));
+        console2.log("blocked      :", value);
+        _propose(_quote(), abi.encodeCall(QuoteModule.setBlocked, (id, value)), "quote.setBlocked(bytes32,bool)");
     }
 
     /// @notice Retunes the margin demanded above Blue's supply rate.

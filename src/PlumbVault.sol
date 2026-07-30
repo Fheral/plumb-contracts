@@ -404,7 +404,9 @@ contract PlumbVault is ERC4626, Ownable2Step, Pausable, ReentrancyGuard, IBuyCal
 
         bytes32 id = IdLib.toId(m);
         uint8 spacing = MIDNIGHT.tickSpacing(id);
-        require(offer.tick <= QUOTE.maxTick(id, m.maturity, spacing), OfferTickTooHigh());
+        // The descriptor is handed to the policy rather than the id: eligibility is read off the
+        // collateral set, and `id` is `IdLib.toId(m)`, so the two cannot disagree.
+        require(offer.tick <= QUOTE.maxTick(m, spacing), OfferTickTooHigh());
 
         return CALLBACK_SUCCESS;
     }
@@ -431,7 +433,7 @@ contract PlumbVault is ERC4626, Ownable2Step, Pausable, ReentrancyGuard, IBuyCal
             maker: address(this),
             start: 0,
             expiry: expiry,
-            tick: QUOTE.maxTick(id, market.maturity, MIDNIGHT.tickSpacing(id)),
+            tick: QUOTE.maxTick(market, MIDNIGHT.tickSpacing(id)),
             group: currentGroup(),
             callback: address(this),
             callbackData: "",
@@ -477,20 +479,21 @@ contract PlumbVault is ERC4626, Ownable2Step, Pausable, ReentrancyGuard, IBuyCal
         b.units += uint128(units);
         b.value += uint128(buyerAssets);
 
-        QuoteModule.MarketConfig memory c = QUOTE.config(id);
-        require(b.units <= c.maxUnits, BookCapExceeded());
-
-        // The cap is checked before touching Blue. A lot larger than the NAV would overflow
+        // Both caps are checked before touching Blue. A lot larger than the NAV would overflow
         // Morpho's share math on an impossible withdrawal, and the refusal would surface as an
         // unreadable arithmetic panic from Blue rather than a Plumb error. Refuse first, move
         // capital second.
         //
         // Midnight will only collect `buyerAssets` when this callback returns: the cash is still
         // here while the lot is already on the book. So the in-flight amount is subtracted from
-        // the NAV, otherwise the cap would be measured against a NAV inflated by double counting.
+        // the NAV, otherwise both caps would be measured against a NAV inflated by double
+        // counting — and the per-market cap, being a fraction of that NAV, would inflate with it.
         uint256 nav = totalAssets();
         require(buyerAssets <= nav, BookCapExceeded());
-        require(bookValue() * 10_000 <= (nav - buyerAssets) * maxBookBps, BookCapExceeded());
+        uint256 navNet = nav - buyerAssets;
+
+        require(b.units <= QUOTE.marketUnitCap(navNet), BookCapExceeded());
+        require(bookValue() * 10_000 <= navNet * maxBookBps, BookCapExceeded());
 
         uint256 idle = idleAssets();
         if (buyerAssets > idle) BLUE.withdraw(blueMarket, buyerAssets - idle, 0, address(this), address(this));

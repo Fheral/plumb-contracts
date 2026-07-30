@@ -208,18 +208,7 @@ contract PlumbReentrancyTest is MidnightForkBase {
 
         vm.startPrank(OWNER);
         quote.setVault(address(vault));
-        quote.setMarketConfig(
-            hostileId,
-            QuoteModule.MarketConfig({
-                enabled: true,
-                rateBps: 900,
-                volSpreadBps: 0,
-                skewBps: 0,
-                minTenor: 1 days,
-                maxTenor: 90 days,
-                maxUnits: 500_000e6
-            })
-        );
+        _configurePolicy(quote, uint16(900));
         vault.setBlueMarket(blueMarket());
         vault.setOperator(OPERATOR);
         vault.setRiskParams(6000, 200_000e6);

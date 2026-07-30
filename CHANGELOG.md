@@ -15,6 +15,42 @@ below list it.
 
 ## [Unreleased]
 
+### Changed — BREAKING
+
+- **Market eligibility is derived from the descriptor, not stored per market.**
+  `QuoteModule.MarketConfig` and `setMarketConfig(bytes32,...)` are gone. In
+  their place: `setBasePolicy` for what does not depend on the market (base
+  rate, skew, tenor bounds, per-market unit cap) and `setCollateralPolicy` for
+  what does (approval, risk premium, LLTV ceiling), keyed by **collateral
+  token**.
+
+  A market is quotable when every collateral in its basket is approved, none
+  exceeds its LLTV ceiling, neither `enterGate` nor `liquidatorGate` is set, and
+  the tenor is in range. Midnight mints one market per maturity, so an allowlist
+  by market id was a treadmill — approving a collateral now covers every present
+  and future market built on it.
+
+  This does not widen what a compromised operator key can do. The bot still
+  selects nothing: it broadcasts what `buildBid` produces, and `isRatified`
+  re-derives the policy at take time. The gate moved from a stored boolean to a
+  function of the descriptor, which cannot be forged — `IdLib.toId` makes the
+  market id the hash of the struct.
+
+- `maxTick` and `maxPrice` take a `Market` instead of `(bytes32, uint256)`, and
+  `effectiveRateBps` takes a `Market` instead of a `bytes32`. The vault holds
+  the descriptor at both call sites, so nothing is read twice or trusted twice.
+
+- The per-market unit cap is a fraction of NAV (`maxUnitsBps`) rather than an
+  absolute. An absolute cap sized for a vault in regime made the skew inert on a
+  small one — at 25,000 USDC of cap on a 214 USDC vault it saturated at 1.2 bps.
+  `IQuoteContext` gains `totalAssets()` for this; `onBuy` nets out the in-flight
+  buyer assets before applying it, as it already did for the book cap.
+
+### Added
+
+- `setBlocked(bytes32,bool)` — refuses one market whatever its descriptor says.
+  The escape hatch, and the only per-market switch left. It can only remove.
+
 ## [0.3.0] — 2026-07-29
 
 The pre-mainnet review's release. Nothing here is exploitable by a third party;

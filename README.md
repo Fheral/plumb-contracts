@@ -91,8 +91,8 @@ DEPLOYER_PRIVATE_KEY=… OWNER=… OPERATOR=… FEE_RECIPIENT=… \
 ```
 
 The script deploys the two contracts, owned by the multisig from the first
-block, and stops there. It quotes nothing: `setVault`, `setMarketConfig`,
-`setBlueMarket`, `setRiskParams`, `setOperator` and finally `openEpoch` are
+block, and stops there. It quotes nothing: `setVault`, `setBasePolicy`,
+`setCollateralPolicy`, `setBlueMarket`, `setRiskParams`, `setOperator` and finally `openEpoch` are
 `onlyOwner` calls, so they are the multisig's — it prints them in order, and
 `script/Admin.s.sol` builds each one. `openEpoch` is last and deliberate: it is
 what starts the quoting.

@@ -36,18 +36,7 @@ contract PlumbVaultTest is MidnightForkBase {
 
         vm.startPrank(OWNER);
         quote.setVault(address(vault));
-        quote.setMarketConfig(
-            id,
-            QuoteModule.MarketConfig({
-                enabled: true,
-                rateBps: RATE_BPS,
-                volSpreadBps: 0,
-                skewBps: 0,
-                minTenor: 1 days,
-                maxTenor: 90 days,
-                maxUnits: 500_000e6
-            })
-        );
+        _configurePolicy(quote, uint16(RATE_BPS));
         vault.setBlueMarket(blueMarket());
         vault.setOperator(OPERATOR);
         vault.setRiskParams(6000, 200_000e6);
@@ -148,46 +137,95 @@ contract PlumbVaultTest is MidnightForkBase {
         uint8 spacing = MIDNIGHT.tickSpacing(id);
         uint256 remaining = MATURITY - block.timestamp;
         uint256 target = 1e18 - (uint256(RATE_BPS) * 1e18 * remaining) / (10_000 * 365 days);
-        assertLe(quote.maxPrice(id, MATURITY, spacing), target, "rounding must disfavor the vault");
+        assertLe(quote.maxPrice(midnightMarket(), spacing), target, "rounding must disfavor the vault");
     }
 
     function test_QuoteRejectsRateOutOfBounds() public {
         vm.startPrank(OWNER);
-        QuoteModule.MarketConfig memory c = QuoteModule.MarketConfig({
-            enabled: true,
-            rateBps: 100,
-            volSpreadBps: 0,
-            skewBps: 0,
-            minTenor: 1 days,
-            maxTenor: 90 days,
-            maxUnits: 1e12
+        QuoteModule.BasePolicy memory p = QuoteModule.BasePolicy({
+            rateBps: 100, skewBps: 0, minTenor: 1 days, maxTenor: 90 days, maxUnitsBps: 10_000
         });
         vm.expectRevert(QuoteModule.RateOutOfBounds.selector);
-        quote.setMarketConfig(id, c);
-        c.rateBps = 5000;
+        quote.setBasePolicy(p);
+        p.rateBps = 5000;
         vm.expectRevert(QuoteModule.RateOutOfBounds.selector);
-        quote.setMarketConfig(id, c);
+        quote.setBasePolicy(p);
         vm.stopPrank();
     }
 
+    /// @dev Eligibility is derived from the descriptor, so the way to make a market unquotable is
+    ///      to withdraw approval from what backs it — not to flip a per-market flag, which no
+    ///      longer exists. Withdrawing one collateral of a basket is enough: a market is only as
+    ///      good as the worst thing that can be posted against it.
+    function test_QuoteRefusesMarketWhoseCollateralIsNotApproved() public {
+        vm.startPrank(OWNER);
+        _configurePolicy(quote, uint16(RATE_BPS));
+        quote.setCollateralPolicy(COLL2, QuoteModule.CollateralPolicy({allowed: false, volSpreadBps: 0, maxLltv: 0}));
+        vm.stopPrank();
+
+        uint8 spacing = MIDNIGHT.tickSpacing(id);
+        vm.expectRevert(QuoteModule.CollateralNotAllowed.selector);
+        quote.maxTick(midnightMarket(), spacing);
+    }
+
+    /// @dev The LLTV ceiling is a second gate on collateral Plumb otherwise accepts: the fixture
+    ///      posts COLL2 at 98%, so approving it at 97% must refuse the market outright rather than
+    ///      quote it a little wider.
+    function test_QuoteRefusesLltvAboveCeiling() public {
+        vm.startPrank(OWNER);
+        _configurePolicy(quote, uint16(RATE_BPS));
+        quote.setCollateralPolicy(
+            COLL2, QuoteModule.CollateralPolicy({allowed: true, volSpreadBps: 0, maxLltv: 0.97e18})
+        );
+        vm.stopPrank();
+
+        uint8 spacing = MIDNIGHT.tickSpacing(id);
+        vm.expectRevert(QuoteModule.LltvTooHigh.selector);
+        quote.maxTick(midnightMarket(), spacing);
+    }
+
+    /// @dev A permissioned market is refused outright rather than priced: a gate is exercised after
+    ///      the position is taken, and no spread expresses "may be unable to exit".
+    function test_QuoteRefusesPermissionedMarket() public {
+        vm.startPrank(OWNER);
+        _configurePolicy(quote, uint16(RATE_BPS));
+        vm.stopPrank();
+
+        Market memory gated = midnightMarket();
+        gated.enterGate = address(0xBEEF);
+        uint8 spacing = MIDNIGHT.tickSpacing(id);
+        vm.expectRevert(QuoteModule.MarketPermissioned.selector);
+        quote.maxTick(gated, spacing);
+    }
+
+    /// @dev The escape hatch: a market that passes every structural check can still be refused one
+    ///      by one. It can only ever remove — there is no per-market way to enable anything.
+    function test_QuoteRefusesBlockedMarket() public {
+        vm.startPrank(OWNER);
+        _configurePolicy(quote, uint16(RATE_BPS));
+        quote.setBlocked(id, true);
+        vm.stopPrank();
+
+        uint8 spacing = MIDNIGHT.tickSpacing(id);
+        vm.expectRevert(QuoteModule.MarketBlocked.selector);
+        quote.maxTick(midnightMarket(), spacing);
+    }
+
     function test_QuoteRejectsTooLongTenor() public {
-        vm.prank(OWNER);
-        quote.setMarketConfig(
-            id,
-            QuoteModule.MarketConfig({
-                enabled: true,
-                rateBps: RATE_BPS,
-                volSpreadBps: 0,
-                skewBps: 0,
-                minTenor: 1 days,
-                maxTenor: 30 days,
-                maxUnits: 500_000e6
+        vm.startPrank(OWNER);
+        _configurePolicy(quote, uint16(RATE_BPS));
+        // A ceiling below the fixture's remaining tenor: the duration is refused, whatever the
+        // collateral says.
+        quote.setBasePolicy(
+            QuoteModule.BasePolicy({
+                rateBps: RATE_BPS, skewBps: 0, minTenor: 1 days, maxTenor: 30 days, maxUnitsBps: 10_000
             })
         );
+        vm.stopPrank();
         // NB: hoist the nested call out of expectRevert, otherwise it consumes it.
         uint8 spacing = MIDNIGHT.tickSpacing(id);
         vm.expectRevert(QuoteModule.TenorOutOfBounds.selector);
-        quote.maxTick(id, MATURITY, spacing);
+        quote.maxTick(midnightMarket(), spacing);
     }
 
     // -------------------------------------------------------------------------
@@ -332,7 +370,7 @@ contract PlumbVaultTest is MidnightForkBase {
         // capacity is `nav * cap / 1e4 - book`, not `nav - book * 1e4 / cap`.
         uint256 paid = _hitBid(maxUnits);
         assertLe(paid, headroom, "an accepted fill never spends more than the headroom");
-        uint256 unitPrice = quote.maxPrice(id, MATURITY, MIDNIGHT.tickSpacing(id));
+        uint256 unitPrice = quote.maxPrice(midnightMarket(), MIDNIGHT.tickSpacing(id));
         assertLt(headroom - paid, (unitPrice / 1e18) + 2, "the headroom must be reachable, not merely an upper bound");
         assertLe(vault.bookValue() * 10_000, vault.totalAssets() * 6000, "book cap respected at the boundary");
 

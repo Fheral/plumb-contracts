@@ -46,18 +46,7 @@ contract PlumbAdversarialTest is MidnightForkBase {
 
         vm.startPrank(OWNER);
         quote.setVault(address(vault));
-        quote.setMarketConfig(
-            id,
-            QuoteModule.MarketConfig({
-                enabled: true,
-                rateBps: 900,
-                volSpreadBps: 0,
-                skewBps: 0,
-                minTenor: 1 days,
-                maxTenor: 90 days,
-                maxUnits: 500_000e6
-            })
-        );
+        _configurePolicy(quote, uint16(900));
         vault.setBlueMarket(blueMarket());
         vault.setOperator(OPERATOR);
         vault.setRiskParams(6000, 200_000e6);
@@ -178,19 +167,9 @@ contract PlumbAdversarialTest is MidnightForkBase {
         Offer memory bid = vault.buildBid(midnightMarket(), type(uint256).max);
 
         // Plumb now demands 20% instead of 9%: the target price drops, so the target tick does too.
-        vm.prank(OWNER);
-        quote.setMarketConfig(
-            id,
-            QuoteModule.MarketConfig({
-                enabled: true,
-                rateBps: 2000,
-                volSpreadBps: 0,
-                skewBps: 0,
-                minTenor: 1 days,
-                maxTenor: 90 days,
-                maxUnits: 500_000e6
-            })
-        );
+        vm.startPrank(OWNER);
+        _configurePolicy(quote, uint16(2000));
+        vm.stopPrank();
 
         _expectRejectedEndToEnd(bid, PlumbVault.OfferTickTooHigh.selector, credit);
     }
